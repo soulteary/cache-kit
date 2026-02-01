@@ -1,5 +1,12 @@
 # cache-kit
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/cache-kit.svg)](https://pkg.go.dev/github.com/soulteary/cache-kit)
+[![Go Report Card](https://goreportcard.com/badge/github.com/soulteary/cache-kit)](https://goreportcard.com/report/github.com/soulteary/cache-kit)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![codecov](https://codecov.io/gh/soulteary/cache-kit/graph/badge.svg)](https://codecov.io/gh/soulteary/cache-kit)
+
+[中文文档](README_CN.md)
+
 A Go library for thread-safe, multi-index memory caching with Redis support.
 
 ## Features
