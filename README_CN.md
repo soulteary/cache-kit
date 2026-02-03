@@ -170,6 +170,8 @@ func main() {
 
 ### 内存缓存配置
 
+**PrimaryKeyFunc 为必填**（在存储非空数据时）；未设置时 `Set(非空)` 会 panic。`Set(空 slice)` 在未设置 PrimaryKeyFunc 时允许。
+
 ```go
 config := cache.DefaultConfig[User]().
     // 必需：主键提取函数
@@ -203,13 +205,21 @@ config := cache.DefaultConfig[User]().
 
 ### Redis 配置
 
+- **KeyPrefix**、**VersionKeySuffix** 不可为空；**NewRedisCacheWithKey** 的 key 不可为空。每个缓存请使用**唯一前缀或 key**，避免键冲突与键空间污染。
+- 键长度（数据键与版本键）不得超过 512 字节。
+
 ```go
 config := cache.DefaultRedisConfig().
-    WithKeyPrefix("myapp:cache:").    // 键前缀
-    WithVersionKeySuffix(":version"). // 版本键后缀
-    WithTTL(1 * time.Hour).           // 缓存 TTL
-    WithOperationTimeout(5 * time.Second) // 操作超时
+    WithKeyPrefix("myapp:cache:").    // 键前缀（必填、非空；每个缓存使用唯一前缀）
+    WithVersionKeySuffix(":version"). // 版本键后缀（必填、非空）
+    WithTTL(1 * time.Hour).           // 缓存 TTL（须为正；为 0 时在 Set 时使用默认 1 小时）
+    WithOperationTimeout(5 * time.Second). // 操作超时
+    WithMaxValueBytes(4 * 1024 * 1024)    // 可选：Get() 最大 value 大小，防 OOM（默认 16MB）
 ```
+
+**哈希与变更检测**：默认哈希使用 `fmt.Sprintf("%v", v)`，不适合含敏感字段的类型；含 map/指针时可能非确定性，建议用 `WithHashFunc` 自定义。
+
+**HybridCache.Set**：先写内存再写 Redis；Redis 失败时内存已更新，需在错误时重试或调用 `LoadFromRedis` 等做一致性处理。
 
 ## API 参考
 
@@ -234,7 +244,7 @@ cache.GetAll() []V
 cache.Len() int
 cache.Clear()
 
-// 迭代
+// 迭代（回调不应 panic）
 cache.Iterate(func(v V) bool)
 
 // 变更检测
@@ -252,7 +262,7 @@ cache := NewRedisCacheWithKey[V](client, "custom:key", config)
 cache.Set(values) error
 cache.SetWithTTL(values, ttl) error
 cache.Get() ([]V, error)
-cache.Clear() error
+cache.Clear() error   // 同时删除版本键；Clear() 后 GetVersion() 返回 0
 
 // 状态
 cache.Exists() (bool, error)

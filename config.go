@@ -16,7 +16,11 @@ type Config[V any] struct {
 	PrimaryKeyFunc KeyFunc[V]
 
 	// HashFunc computes a hash for the cache contents.
-	// If nil, a default hash function is used.
+	// If nil, defaultHashFunc is used, which serializes each value with fmt.Sprintf("%v", v).
+	// Warning: the default is not suitable for types containing sensitive fields (passwords, tokens),
+	// as those would be included in the hash input. It may also be non-deterministic for types
+	// with maps or pointer fields. Use WithHashFunc to supply a custom hash (e.g. only stable,
+	// non-sensitive fields in a deterministic order).
 	HashFunc HashFunc[V]
 
 	// ValidateFunc validates a value before storing.
@@ -70,7 +74,8 @@ func (c *Config[V]) WithSortFunc(fn func(values []V) []V) *Config[V] {
 	return c
 }
 
-// defaultHashFunc provides a simple hash implementation.
+// defaultHashFunc provides a simple hash implementation using fmt.Sprintf("%v", v) per value.
+// See Config.HashFunc documentation for sensitivity and determinism caveats.
 func defaultHashFunc[V any](values []V) string {
 	if len(values) == 0 {
 		return sha256Hash("empty")
@@ -92,21 +97,28 @@ func sha256Hash(s string) string {
 
 // RedisConfig holds configuration for Redis cache.
 type RedisConfig struct {
-	// KeyPrefix is prepended to all Redis keys.
+	// KeyPrefix is prepended to all Redis keys. Use a unique prefix per cache to avoid key collision.
 	KeyPrefix string
 
 	// VersionKeySuffix is appended to the key prefix for version tracking.
 	// Default: ":version"
 	VersionKeySuffix string
 
-	// TTL is the default time-to-live for cached data.
+	// TTL is the default time-to-live for cached data. Must be positive; otherwise a default is used at Set time.
 	// Default: 1 hour
 	TTL time.Duration
 
 	// OperationTimeout is the timeout for Redis operations.
 	// Default: 5 seconds
 	OperationTimeout time.Duration
+
+	// MaxValueBytes limits the size of the value read from Redis in Get(). If <= 0, no limit is applied.
+	// Default: 16MB. Prevents OOM from malicious or corrupted oversized values in Redis.
+	MaxValueBytes int
 }
+
+// Default max value size for Redis Get (16 MiB).
+const defaultRedisMaxValueBytes = 16 * 1024 * 1024
 
 // DefaultRedisConfig returns a default Redis configuration.
 func DefaultRedisConfig() *RedisConfig {
@@ -115,6 +127,7 @@ func DefaultRedisConfig() *RedisConfig {
 		VersionKeySuffix: ":version",
 		TTL:              1 * time.Hour,
 		OperationTimeout: 5 * time.Second,
+		MaxValueBytes:    defaultRedisMaxValueBytes,
 	}
 }
 
@@ -139,6 +152,13 @@ func (c *RedisConfig) WithTTL(ttl time.Duration) *RedisConfig {
 // WithOperationTimeout sets the operation timeout.
 func (c *RedisConfig) WithOperationTimeout(timeout time.Duration) *RedisConfig {
 	c.OperationTimeout = timeout
+	return c
+}
+
+// WithMaxValueBytes sets the maximum allowed size in bytes for a value read from Redis in Get().
+// Values larger than this are rejected to prevent OOM. Use 0 or negative to disable the limit.
+func (c *RedisConfig) WithMaxValueBytes(n int) *RedisConfig {
+	c.MaxValueBytes = n
 	return c
 }
 

@@ -98,6 +98,9 @@ func TestDefaultRedisConfig(t *testing.T) {
 	if config.OperationTimeout != 5*time.Second {
 		t.Errorf("Expected operation timeout 5s, got %v", config.OperationTimeout)
 	}
+	if config.MaxValueBytes != 16*1024*1024 {
+		t.Errorf("Expected default MaxValueBytes 16MB, got %d", config.MaxValueBytes)
+	}
 }
 
 func TestRedisConfigBuilder(t *testing.T) {
@@ -105,7 +108,8 @@ func TestRedisConfigBuilder(t *testing.T) {
 		WithKeyPrefix("myapp:").
 		WithVersionKeySuffix(":ver").
 		WithTTL(30 * time.Minute).
-		WithOperationTimeout(10 * time.Second)
+		WithOperationTimeout(10 * time.Second).
+		WithMaxValueBytes(1024)
 
 	if config.KeyPrefix != "myapp:" {
 		t.Errorf("Expected key prefix 'myapp:', got '%s'", config.KeyPrefix)
@@ -118,6 +122,16 @@ func TestRedisConfigBuilder(t *testing.T) {
 	}
 	if config.OperationTimeout != 10*time.Second {
 		t.Errorf("Expected operation timeout 10s, got %v", config.OperationTimeout)
+	}
+	if config.MaxValueBytes != 1024 {
+		t.Errorf("Expected MaxValueBytes 1024, got %d", config.MaxValueBytes)
+	}
+}
+
+func TestRedisConfig_WithMaxValueBytesZero(t *testing.T) {
+	config := DefaultRedisConfig().WithMaxValueBytes(0)
+	if config.MaxValueBytes != 0 {
+		t.Errorf("Expected MaxValueBytes 0 to disable limit, got %d", config.MaxValueBytes)
 	}
 }
 
@@ -157,6 +171,25 @@ func TestDefaultHashFunc(t *testing.T) {
 	hash3 := defaultHashFunc([]TestUser{{ID: "1"}})
 	if hash2 != hash3 {
 		t.Error("Expected same hash for same data")
+	}
+}
+
+// UserWithMap is used to test defaultHashFunc with a type containing a map (non-deterministic iteration).
+type UserWithMap struct {
+	ID   string
+	Meta map[string]int
+}
+
+func TestDefaultHashFunc_WithMapType(t *testing.T) {
+	// defaultHashFunc uses fmt.Sprintf("%v", v); types with map still produce a non-empty hash.
+	// Order of map keys is non-deterministic, so hash may vary between runs for "same" logical data.
+	vals := []UserWithMap{{ID: "1", Meta: map[string]int{"a": 1, "b": 2}}}
+	h := defaultHashFunc(vals)
+	if h == "" {
+		t.Error("Expected non-empty hash for slice with map field")
+	}
+	if len(h) != 64 {
+		t.Errorf("Expected 64-char SHA256 hex, got len %d", len(h))
 	}
 }
 

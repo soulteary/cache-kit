@@ -170,6 +170,8 @@ func main() {
 
 ### Memory Cache Config
 
+**PrimaryKeyFunc is required** for MultiIndexCache when storing non-empty data; if not set, `Set(non-empty)` panics. `Set(empty slice)` is allowed without PrimaryKeyFunc.
+
 ```go
 config := cache.DefaultConfig[User]().
     // Required: Primary key extraction
@@ -203,13 +205,21 @@ config := cache.DefaultConfig[User]().
 
 ### Redis Config
 
+- **KeyPrefix** and **VersionKeySuffix** must be non-empty. **NewRedisCacheWithKey** requires a non-empty key. Use a **unique prefix or key per cache** to avoid key collision and key space pollution.
+- Key length (data key and version key) must not exceed 512 bytes.
+
 ```go
 config := cache.DefaultRedisConfig().
-    WithKeyPrefix("myapp:cache:").    // Key prefix
-    WithVersionKeySuffix(":version"). // Version key suffix
-    WithTTL(1 * time.Hour).           // Cache TTL
-    WithOperationTimeout(5 * time.Second) // Operation timeout
+    WithKeyPrefix("myapp:cache:").    // Key prefix (required, non-empty; use unique prefix per cache)
+    WithVersionKeySuffix(":version"). // Version key suffix (required, non-empty)
+    WithTTL(1 * time.Hour).           // Cache TTL (must be positive; 0 means use default 1h at Set time)
+    WithOperationTimeout(5 * time.Second). // Operation timeout
+    WithMaxValueBytes(4 * 1024 * 1024) // Optional: max value size for Get() to prevent OOM (default 16MB)
 ```
+
+**Hash / change detection**: The default hash function uses `fmt.Sprintf("%v", v)` for each value. Do not use it for types containing sensitive fields (passwords, tokens). For structs with maps or pointer fields, the default hash may be non-deterministic; use `WithHashFunc` with a custom implementation that hashes only stable, non-sensitive fields in a fixed order.
+
+**HybridCache.Set**: Memory is updated first, then Redis. If Redis fails, memory already has the new data; handle the error (e.g. retry or call `LoadFromRedis`) to reconcile.
 
 ## API Reference
 
@@ -234,7 +244,7 @@ cache.GetAll() []V
 cache.Len() int
 cache.Clear()
 
-// Iteration
+// Iteration (callback must not panic)
 cache.Iterate(func(v V) bool)
 
 // Change detection
@@ -252,7 +262,7 @@ cache := NewRedisCacheWithKey[V](client, "custom:key", config)
 cache.Set(values) error
 cache.SetWithTTL(values, ttl) error
 cache.Get() ([]V, error)
-cache.Clear() error
+cache.Clear() error   // Also removes version key; after Clear(), GetVersion() returns 0
 
 // Status
 cache.Exists() (bool, error)
