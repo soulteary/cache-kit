@@ -91,6 +91,9 @@ func main() {
 package main
 
 import (
+    "fmt"
+    "time"
+
     "github.com/redis/go-redis/v9"
     cache "github.com/soulteary/cache-kit"
 )
@@ -153,7 +156,9 @@ func main() {
     c.AddIndex("email", func(u User) string { return u.Email })
 
     // Set stores in both memory and Redis
-    c.Set([]User{{ID: "1", Email: "alice@example.com"}})
+    if err := c.Set([]User{{ID: "1", Email: "alice@example.com"}}); err != nil {
+        panic(err)
+    }
 
     // Fast lookup from memory
     user, ok := c.GetByIndex("email", "alice@example.com")
@@ -207,11 +212,13 @@ config := cache.DefaultConfig[User]().
 
 - **KeyPrefix** and **VersionKeySuffix** must be non-empty. **NewRedisCacheWithKey** requires a non-empty key. Use a **unique prefix or key per cache** to avoid key collision and key space pollution.
 - Key length (data key and version key) must not exceed 512 bytes.
+- Actual Redis keys: data key = `KeyPrefix + "data"` (e.g. `myapp:cache:data`); version key = data key + `VersionKeySuffix` (e.g. `myapp:cache:data:version`).
+- **DefaultRedisConfig** default values: `KeyPrefix` is `"cache:"`, `VersionKeySuffix` is `":version"`; override with a unique prefix per cache.
 
 ```go
 config := cache.DefaultRedisConfig().
-    WithKeyPrefix("myapp:cache:").    // Key prefix (required, non-empty; use unique prefix per cache)
-    WithVersionKeySuffix(":version"). // Version key suffix (required, non-empty)
+    WithKeyPrefix("myapp:cache:").    // Key prefix (required, non-empty; default "cache:"; use unique prefix per cache)
+    WithVersionKeySuffix(":version"). // Version key suffix (required, non-empty; default ":version")
     WithTTL(1 * time.Hour).           // Cache TTL (must be positive; 0 means use default 1h at Set time)
     WithOperationTimeout(5 * time.Second). // Operation timeout
     WithMaxValueBytes(4 * 1024 * 1024) // Optional: max value size for Get() to prevent OOM (default 16MB)

@@ -91,6 +91,9 @@ func main() {
 package main
 
 import (
+    "fmt"
+    "time"
+
     "github.com/redis/go-redis/v9"
     cache "github.com/soulteary/cache-kit"
 )
@@ -153,7 +156,9 @@ func main() {
     c.AddIndex("email", func(u User) string { return u.Email })
 
     // Set 同时存储到内存和 Redis
-    c.Set([]User{{ID: "1", Email: "alice@example.com"}})
+    if err := c.Set([]User{{ID: "1", Email: "alice@example.com"}}); err != nil {
+        panic(err)
+    }
 
     // 从内存快速查询
     user, ok := c.GetByIndex("email", "alice@example.com")
@@ -207,11 +212,13 @@ config := cache.DefaultConfig[User]().
 
 - **KeyPrefix**、**VersionKeySuffix** 不可为空；**NewRedisCacheWithKey** 的 key 不可为空。每个缓存请使用**唯一前缀或 key**，避免键冲突与键空间污染。
 - 键长度（数据键与版本键）不得超过 512 字节。
+- 实际 Redis 键名：数据键 = `KeyPrefix + "data"`（如 `myapp:cache:data`）；版本键 = 数据键 + `VersionKeySuffix`（如 `myapp:cache:data:version`）。
+- **DefaultRedisConfig** 默认：`KeyPrefix` 为 `"cache:"`，`VersionKeySuffix` 为 `":version"`；每个缓存请用唯一前缀覆盖。
 
 ```go
 config := cache.DefaultRedisConfig().
-    WithKeyPrefix("myapp:cache:").    // 键前缀（必填、非空；每个缓存使用唯一前缀）
-    WithVersionKeySuffix(":version"). // 版本键后缀（必填、非空）
+    WithKeyPrefix("myapp:cache:").    // 键前缀（必填、非空；默认 "cache:"；每个缓存使用唯一前缀）
+    WithVersionKeySuffix(":version"). // 版本键后缀（必填、非空；默认 ":version"）
     WithTTL(1 * time.Hour).           // 缓存 TTL（须为正；为 0 时在 Set 时使用默认 1 小时）
     WithOperationTimeout(5 * time.Second). // 操作超时
     WithMaxValueBytes(4 * 1024 * 1024)    // 可选：Get() 最大 value 大小，防 OOM（默认 16MB）

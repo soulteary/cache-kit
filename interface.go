@@ -8,17 +8,10 @@
 //
 // Example usage:
 //
-//	// Create a memory cache for users
-//	cache := cache.NewMultiIndexCache[User](cache.DefaultConfig())
-//
-//	// Add indexes
+//	config := cache.DefaultConfig[User]().WithPrimaryKey(func(u User) string { return u.ID })
+//	cache := cache.NewMultiIndexCache[User](config)
 //	cache.AddIndex("email", func(u User) string { return u.Email })
-//	cache.AddIndex("user_id", func(u User) string { return u.UserID })
-//
-//	// Set items
 //	cache.Set(users)
-//
-//	// Lookup by different keys
 //	user, ok := cache.GetByIndex("email", "user@example.com")
 package cache
 
