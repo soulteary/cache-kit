@@ -4,7 +4,7 @@ go 1.25
 
 require (
 	github.com/alicebob/miniredis/v2 v2.36.1
-	github.com/redis/go-redis/v9 v9.17.2
+	github.com/redis/go-redis/v9 v9.17.3
 )
 
 require (
