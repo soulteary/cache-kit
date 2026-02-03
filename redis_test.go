@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -85,6 +86,36 @@ func TestRedisCache_BasicOperations(t *testing.T) {
 	}
 	if exists {
 		t.Error("Expected cache to not exist after Clear")
+	}
+}
+
+func TestRedisCache_ClearAlsoRemovesVersion(t *testing.T) {
+	_, client := setupMiniRedis(t)
+
+	config := DefaultRedisConfig().WithKeyPrefix("test:")
+	cache := NewRedisCache[TestUser](client, config)
+
+	if err := cache.Set([]TestUser{{ID: "1"}}); err != nil {
+		t.Fatalf("Set error: %v", err)
+	}
+	versionBefore, err := cache.GetVersion()
+	if err != nil {
+		t.Fatalf("GetVersion error: %v", err)
+	}
+	if versionBefore != 1 {
+		t.Errorf("Expected version 1 before Clear, got %d", versionBefore)
+	}
+
+	if err := cache.Clear(); err != nil {
+		t.Fatalf("Clear error: %v", err)
+	}
+
+	versionAfter, err := cache.GetVersion()
+	if err != nil {
+		t.Fatalf("GetVersion error: %v", err)
+	}
+	if versionAfter != 0 {
+		t.Errorf("Expected GetVersion() to return 0 after Clear(), got %d", versionAfter)
 	}
 }
 
@@ -382,6 +413,26 @@ func TestRedisCache_GetInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestRedisCache_GetOversizedValue(t *testing.T) {
+	mr, client := setupMiniRedis(t)
+
+	config := DefaultRedisConfig().WithKeyPrefix("test:").WithMaxValueBytes(10)
+	cache := NewRedisCache[TestUser](client, config)
+
+	// Set a value larger than MaxValueBytes (10 bytes)
+	if err := mr.Set(config.KeyPrefix+"data", "0123456789abcdef"); err != nil {
+		t.Fatalf("Failed to set value: %v", err)
+	}
+
+	_, err := cache.Get()
+	if err == nil {
+		t.Error("Expected error when value exceeds MaxValueBytes")
+	}
+	if err != nil && !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("Expected error message to contain 'exceeds', got: %v", err)
+	}
+}
+
 func TestRedisCache_DefaultNilConfig(t *testing.T) {
 	_, client := setupMiniRedis(t)
 
@@ -490,4 +541,132 @@ func TestRedisCache_VersionKey(t *testing.T) {
 	if version != 1 {
 		t.Errorf("Expected version 1, got %d", version)
 	}
+}
+
+func TestRedisCache_GetWithMaxValueBytesDisabled(t *testing.T) {
+	mr, client := setupMiniRedis(t)
+
+	config := DefaultRedisConfig().WithKeyPrefix("test:").WithMaxValueBytes(0)
+	cache := NewRedisCache[TestUser](client, config)
+
+	// Set a value larger than default 16MB would allow - use small but > 10 bytes to prove limit is off
+	payload := `[{"ID":"1","Email":"a@b.c","Phone":"","Name":"x"}]`
+	if err := mr.Set(config.KeyPrefix+"data", payload); err != nil {
+		t.Fatalf("Failed to set value: %v", err)
+	}
+
+	got, err := cache.Get()
+	if err != nil {
+		t.Fatalf("Get with MaxValueBytes=0 should not reject by size: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "1" {
+		t.Errorf("Expected one user with ID 1, got %v", got)
+	}
+}
+
+func TestRedisCache_GetValueAtExactMaxSize(t *testing.T) {
+	mr, client := setupMiniRedis(t)
+
+	// Boundary: value length exactly equal to MaxValueBytes should be accepted (no "exceeds max" error)
+	payload := `[{"ID":"1"}]` // 13 bytes
+	config := DefaultRedisConfig().WithKeyPrefix("test:").WithMaxValueBytes(len(payload))
+	cache := NewRedisCache[TestUser](client, config)
+
+	if err := mr.Set(config.KeyPrefix+"data", payload); err != nil {
+		t.Fatalf("Failed to set value: %v", err)
+	}
+
+	got, err := cache.Get()
+	if err != nil {
+		t.Fatalf("Get at exact max size should succeed: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "1" {
+		t.Errorf("Expected one user with ID 1, got %v", got)
+	}
+}
+
+func TestRedisCache_TTLFallbackWhenZero(t *testing.T) {
+	mr, client := setupMiniRedis(t)
+
+	config := DefaultRedisConfig().
+		WithKeyPrefix("ttl:").
+		WithTTL(0) // Invalid/zero TTL - should use 1h fallback
+	cache := NewRedisCache[TestUser](client, config)
+
+	if err := cache.Set([]TestUser{{ID: "1"}}); err != nil {
+		t.Fatalf("Set with TTL=0 should use fallback and succeed: %v", err)
+	}
+
+	ttl, err := cache.TTL()
+	if err != nil {
+		t.Fatalf("TTL error: %v", err)
+	}
+	if ttl <= 0 {
+		t.Errorf("Expected positive TTL when config TTL is 0 (fallback), got %v", ttl)
+	}
+
+	// Key should eventually expire with fallback TTL (e.g. 1h); fast-forward to verify if miniredis supports it
+	mr.FastForward(2 * time.Hour)
+	exists, err := cache.Exists()
+	if err != nil {
+		t.Fatalf("Exists error: %v", err)
+	}
+	if exists {
+		t.Error("Expected key to expire after 2h (fallback TTL is 1h)")
+	}
+}
+
+func TestRedisCache_SetWithTTLZeroUsesFallback(t *testing.T) {
+	_, client := setupMiniRedis(t)
+
+	config := DefaultRedisConfig().WithKeyPrefix("ttl2:")
+	cache := NewRedisCache[TestUser](client, config)
+
+	err := cache.SetWithTTL([]TestUser{{ID: "1"}}, 0)
+	if err != nil {
+		t.Fatalf("SetWithTTL with 0 should use fallback: %v", err)
+	}
+
+	ttl, err := cache.TTL()
+	if err != nil {
+		t.Fatalf("TTL error: %v", err)
+	}
+	if ttl <= 0 {
+		t.Errorf("Expected positive TTL when SetWithTTL(0), got %v", ttl)
+	}
+}
+
+func TestRedisCache_EmptyKeyPrefixPanics(t *testing.T) {
+	_, client := setupMiniRedis(t)
+	config := DefaultRedisConfig().WithKeyPrefix("")
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Expected panic when KeyPrefix is empty")
+		}
+	}()
+	NewRedisCache[TestUser](client, config)
+}
+
+func TestRedisCache_EmptyKeyPanics(t *testing.T) {
+	_, client := setupMiniRedis(t)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Expected panic when key is empty")
+		}
+	}()
+	NewRedisCacheWithKey[TestUser](client, "", DefaultRedisConfig())
+}
+
+func TestRedisCache_EmptyVersionKeySuffixPanics(t *testing.T) {
+	_, client := setupMiniRedis(t)
+	config := DefaultRedisConfig().WithKeyPrefix("x:").WithVersionKeySuffix("")
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Expected panic when VersionKeySuffix is empty")
+		}
+	}()
+	NewRedisCache[TestUser](client, config)
 }

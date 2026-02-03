@@ -109,6 +109,15 @@ func TestMemoryCache_MultiIndex(t *testing.T) {
 		t.Error("Expected case-insensitive email lookup to work")
 	}
 
+	// Test index key normalization: leading/trailing space
+	user, ok = cache.GetByIndex("email", "  user1@example.com  ")
+	if !ok {
+		t.Error("Expected trimmed email lookup to work")
+	}
+	if user.ID != "1" {
+		t.Errorf("Expected ID 1, got %s", user.ID)
+	}
+
 	// Test nonexistent index
 	_, ok = cache.GetByIndex("nonexistent", "value")
 	if ok {
@@ -523,16 +532,23 @@ func TestMemoryCache_NoPrimaryKeyFunc(t *testing.T) {
 
 	cache := NewMultiIndexCache(config)
 
+	// Set(empty) is allowed and does not panic
+	cache.Set([]TestUser{})
+	if cache.Len() != 0 {
+		t.Errorf("Expected 0 items after Set(empty), got %d", cache.Len())
+	}
+
+	// Set(non-empty) without PrimaryKeyFunc must panic
 	users := []TestUser{
 		{ID: "1", Name: "User 1"},
 		{ID: "2", Name: "User 2"},
 	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Expected panic when Set(non-empty) with nil PrimaryKeyFunc")
+		}
+	}()
 	cache.Set(users)
-
-	// Without primary key func, all items should be skipped
-	if cache.Len() != 0 {
-		t.Errorf("Expected 0 items without primary key func, got %d", cache.Len())
-	}
 }
 
 func TestMemoryCache_EmptyIndexKey(t *testing.T) {
@@ -578,6 +594,40 @@ func TestMemoryCache_GetNotFound(t *testing.T) {
 	_, ok := cache.Get("nonexistent")
 	if ok {
 		t.Error("Expected Get to return false for non-existent key")
+	}
+}
+
+func TestMemoryCache_SetEmptySlice(t *testing.T) {
+	config := DefaultConfig[TestUser]().
+		WithPrimaryKey(func(u TestUser) string { return u.ID })
+
+	cache := NewMultiIndexCache(config)
+	cache.Set([]TestUser{{ID: "1"}})
+	if cache.Len() != 1 {
+		t.Fatalf("Expected 1 item, got %d", cache.Len())
+	}
+
+	cache.Set([]TestUser{})
+	if cache.Len() != 0 {
+		t.Errorf("Expected 0 items after Set(empty slice), got %d", cache.Len())
+	}
+	h := cache.GetHash()
+	if h == "" {
+		t.Error("Expected non-empty hash for empty cache state")
+	}
+}
+
+func TestMemoryCache_SetNilSlice(t *testing.T) {
+	config := DefaultConfig[TestUser]().
+		WithPrimaryKey(func(u TestUser) string { return u.ID })
+
+	cache := NewMultiIndexCache(config)
+	cache.Set([]TestUser{{ID: "1"}})
+
+	// Set(nil) is valid in Go; len(nil) is 0, so we iterate over 0 items and end up with empty cache
+	cache.Set(nil)
+	if cache.Len() != 0 {
+		t.Errorf("Expected 0 items after Set(nil), got %d", cache.Len())
 	}
 }
 

@@ -106,7 +106,12 @@ func (c *MemoryCache[V]) Get(key string) (V, bool) {
 // Set stores all values and rebuilds all indexes.
 // Values are validated and normalized if the corresponding functions are set.
 // Duplicate primary keys will be updated (last one wins).
+// Panics if PrimaryKeyFunc is nil and len(values) > 0; set PrimaryKeyFunc via config before use with non-empty data.
 func (c *MemoryCache[V]) Set(values []V) {
+	if len(values) > 0 && c.config.PrimaryKeyFunc == nil {
+		panic("cache-kit: MultiIndexCache requires PrimaryKeyFunc when setting non-empty data; set it via config.WithPrimaryKey()")
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -208,6 +213,7 @@ func (c *MemoryCache[V]) GetHash() string {
 
 // Iterate applies a function to each cached value in insertion order.
 // If the function returns false, iteration stops.
+// The callback must not panic; if it does, the read lock may block other goroutines until recovery.
 func (c *MemoryCache[V]) Iterate(fn func(value V) bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
