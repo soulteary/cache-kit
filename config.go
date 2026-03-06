@@ -83,7 +83,7 @@ func defaultHashFunc[V any](values []V) string {
 
 	var sb strings.Builder
 	for _, v := range values {
-		sb.WriteString(fmt.Sprintf("%v\n", v))
+		fmt.Fprintf(&sb, "%v\n", v)
 	}
 	return sha256Hash(sb.String())
 }
