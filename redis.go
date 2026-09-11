@@ -153,25 +153,19 @@ func (c *RedisCache[V]) Get() ([]V, error) {
 	ctx, cancel := c.getContext()
 	defer cancel()
 
-	// Check the size BEFORE fetching. Reading the value and then measuring it
+	// Measure and fetch ATOMICALLY. Reading the value and then measuring it
 	// does not prevent the allocation the limit exists to prevent -- by the
-	// time len(data) can be compared, the oversized value is already in memory.
-	if maxBytes := c.config.MaxValueBytes; maxBytes > 0 {
-		size, err := c.client.StrLen(ctx, c.key).Result()
-		if err != nil && !errors.Is(err, redis.Nil) {
-			return nil, fmt.Errorf("failed to measure cache value: %w", err)
-		}
-		if err == nil && size > int64(maxBytes) {
-			return nil, fmt.Errorf("cache value size %d exceeds max allowed %d", size, maxBytes)
-		}
-	}
-
-	data, err := c.client.Get(ctx, c.key).Bytes()
-	if errors.Is(err, redis.Nil) {
-		return []V{}, nil
-	}
+	// time len(data) can be compared, the oversized value is already in
+	// memory. Measuring first with a separate STRLEN has the opposite
+	// problem: another writer can replace the key between the two commands,
+	// so the value that arrives can exceed the limit anyway. The script does
+	// both in one round trip, under Redis's single-threaded execution.
+	data, err := c.getBounded(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get cache: %w", err)
+		return nil, err
+	}
+	if data == nil {
+		return []V{}, nil
 	}
 
 	var values []V
@@ -295,7 +289,13 @@ func (c *RedisCache[V]) Refresh() error {
 	ttl := c.effectiveTTL(c.config.TTL)
 	pipe := c.client.Pipeline()
 	pipe.Expire(ctx, c.key, ttl)
-	pipe.Expire(ctx, c.versionKey(), ttl)
+	// The version key stays persistent, as Set leaves it. Expiring it here
+	// meant any cache that gets refreshed lost its version once the TTL
+	// elapsed; the next Set then restarted the counter at 1, and a consumer
+	// that had already observed a higher version stopped seeing updates --
+	// exactly the reset Set was changed to prevent. Persist also repairs a
+	// version key written by an earlier version of this package.
+	pipe.Persist(ctx, c.versionKey())
 
 	_, err := pipe.Exec(ctx)
 	return err
@@ -364,4 +364,62 @@ func (c *HybridCache[V]) Memory() *MemoryCache[V] {
 // Redis returns the underlying Redis cache for direct access.
 func (c *HybridCache[V]) Redis() *RedisCache[V] {
 	return c.redis
+}
+
+// boundedGetScript measures a key and returns its value in one atomic step.
+//
+// ARGV[1] is the byte limit; 0 means unlimited. The reply is a two-element
+// array: {"ok", value}, {"missing", ""} or {"toolarge", size}.
+var boundedGetScript = redis.NewScript(`
+local limit = tonumber(ARGV[1])
+if limit > 0 then
+  local size = redis.call('STRLEN', KEYS[1])
+  if size > limit then
+    return {'toolarge', tostring(size)}
+  end
+end
+local value = redis.call('GET', KEYS[1])
+if value == false then
+  return {'missing', ''}
+end
+return {'ok', value}
+`)
+
+// getBounded fetches the cache value, refusing one over MaxValueBytes.
+//
+// It returns (nil, nil) when the key does not exist.
+func (c *RedisCache[V]) getBounded(ctx context.Context) ([]byte, error) {
+	maxBytes := c.config.MaxValueBytes
+	if maxBytes <= 0 {
+		data, err := c.client.Get(ctx, c.key).Bytes()
+		if errors.Is(err, redis.Nil) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to get cache: %w", err)
+		}
+		return data, nil
+	}
+
+	reply, err := boundedGetScript.Run(ctx, c.client, []string{c.key}, maxBytes).Slice()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cache: %w", err)
+	}
+	if len(reply) != 2 {
+		return nil, fmt.Errorf("failed to get cache: unexpected reply of %d elements", len(reply))
+	}
+
+	status, _ := reply[0].(string)
+	payload, _ := reply[1].(string)
+
+	switch status {
+	case "missing":
+		return nil, nil
+	case "toolarge":
+		return nil, fmt.Errorf("cache value size %s exceeds max allowed %d", payload, maxBytes)
+	case "ok":
+		return []byte(payload), nil
+	default:
+		return nil, fmt.Errorf("failed to get cache: unexpected status %q", status)
+	}
 }
