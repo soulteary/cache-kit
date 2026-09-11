@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -79,6 +80,11 @@ func NewRedisCacheWithKey[V any](client *redis.Client, key string, config *Redis
 }
 
 // getContext creates a context with timeout.
+//
+// NOTE: this is rooted at context.Background, so a caller's cancellation and
+// trace context do not reach Redis. Every method here takes no context
+// parameter, so fixing that means changing the exported signatures; it is
+// called out rather than changed.
 func (c *RedisCache[V]) getContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), c.config.OperationTimeout)
 }
@@ -114,10 +120,19 @@ func (c *RedisCache[V]) Set(values []V) error {
 	defer cancel()
 
 	ttl := c.effectiveTTL(c.config.TTL)
-	pipe := c.client.Pipeline()
+	// TxPipeline (MULTI/EXEC), not Pipeline: a plain pipeline is only batching,
+	// so two concurrent writers could interleave and leave the data from one
+	// paired with the version from the other -- which defeats the point of
+	// having a version at all.
+	//
+	// The version key is deliberately NOT given a TTL. Expiring it reset the
+	// counter to zero, so a consumer comparing "is the version higher than what
+	// I last saw" would stop refreshing after the reset. It is a single
+	// integer; Clear removes it explicitly.
+	pipe := c.client.TxPipeline()
 	pipe.Set(ctx, c.key, data, ttl)
 	pipe.Incr(ctx, c.versionKey())
-	pipe.Expire(ctx, c.versionKey(), ttl)
+	pipe.Persist(ctx, c.versionKey())
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {
@@ -138,17 +153,25 @@ func (c *RedisCache[V]) Get() ([]V, error) {
 	ctx, cancel := c.getContext()
 	defer cancel()
 
+	// Check the size BEFORE fetching. Reading the value and then measuring it
+	// does not prevent the allocation the limit exists to prevent -- by the
+	// time len(data) can be compared, the oversized value is already in memory.
+	if maxBytes := c.config.MaxValueBytes; maxBytes > 0 {
+		size, err := c.client.StrLen(ctx, c.key).Result()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("failed to measure cache value: %w", err)
+		}
+		if err == nil && size > int64(maxBytes) {
+			return nil, fmt.Errorf("cache value size %d exceeds max allowed %d", size, maxBytes)
+		}
+	}
+
 	data, err := c.client.Get(ctx, c.key).Bytes()
-	if err == redis.Nil {
+	if errors.Is(err, redis.Nil) {
 		return []V{}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get cache: %w", err)
-	}
-
-	maxBytes := c.config.MaxValueBytes
-	if maxBytes > 0 && len(data) > maxBytes {
-		return nil, fmt.Errorf("cache value size %d exceeds max allowed %d", len(data), maxBytes)
 	}
 
 	var values []V
@@ -207,7 +230,7 @@ func (c *RedisCache[V]) Clear() error {
 	ctx, cancel := c.getContext()
 	defer cancel()
 
-	pipe := c.client.Pipeline()
+	pipe := c.client.TxPipeline()
 	pipe.Del(ctx, c.key)
 	pipe.Del(ctx, c.versionKey())
 	_, err := pipe.Exec(ctx)
@@ -229,10 +252,11 @@ func (c *RedisCache[V]) SetWithTTL(values []V, ttl time.Duration) error {
 	defer cancel()
 
 	effectiveTTL := c.effectiveTTL(ttl)
-	pipe := c.client.Pipeline()
+	// See Set: atomic, and the version key outlives the data.
+	pipe := c.client.TxPipeline()
 	pipe.Set(ctx, c.key, data, effectiveTTL)
 	pipe.Incr(ctx, c.versionKey())
-	pipe.Expire(ctx, c.versionKey(), effectiveTTL)
+	pipe.Persist(ctx, c.versionKey())
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {

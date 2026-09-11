@@ -3,6 +3,7 @@ package cache
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -16,11 +17,14 @@ type Config[V any] struct {
 	PrimaryKeyFunc KeyFunc[V]
 
 	// HashFunc computes a hash for the cache contents.
-	// If nil, defaultHashFunc is used, which serializes each value with fmt.Sprintf("%v", v).
-	// Warning: the default is not suitable for types containing sensitive fields (passwords, tokens),
-	// as those would be included in the hash input. It may also be non-deterministic for types
-	// with maps or pointer fields. Use WithHashFunc to supply a custom hash (e.g. only stable,
-	// non-sensitive fields in a deterministic order).
+	// If nil, defaultHashFunc is used, which serializes each value as JSON.
+	//
+	// Warning: the default is not suitable for types containing sensitive
+	// fields (passwords, tokens), as those would be included in the hash
+	// input. Types JSON cannot represent -- channels, funcs, cycles, or types
+	// whose identity lives in unexported fields -- need a custom HashFunc.
+	// Use WithHashFunc to supply one (e.g. only stable, non-sensitive fields
+	// in a deterministic order).
 	HashFunc HashFunc[V]
 
 	// ValidateFunc validates a value before storing.
@@ -34,6 +38,13 @@ type Config[V any] struct {
 	// SortFunc is used for deterministic hash calculation.
 	// If nil, values are hashed in insertion order.
 	SortFunc func(values []V) []V
+
+	// OnIndexConflict, if set, is called when two values map to the same
+	// normalized index key. The later value wins and the earlier one becomes
+	// unreachable through that index, which is otherwise entirely silent --
+	// a lookup by email can return a different record than the one intended
+	// when two entries differ only in case or surrounding whitespace.
+	OnIndexConflict func(indexName, key, existingPrimaryKey, newPrimaryKey string)
 }
 
 // DefaultConfig returns a default configuration.
@@ -76,14 +87,39 @@ func (c *Config[V]) WithSortFunc(fn func(values []V) []V) *Config[V] {
 
 // defaultHashFunc provides a simple hash implementation using fmt.Sprintf("%v", v) per value.
 // See Config.HashFunc documentation for sensitivity and determinism caveats.
+// emptyHash is the hash of a cache holding no values. Clear and Set(nil) must
+// produce the same value for change detection to be meaningful.
+func emptyHash() string { return sha256Hash("empty") }
+
+// defaultHashFunc computes a content hash over the cached values.
+//
+// It serialises each value as JSON rather than with fmt's %v. %v prints a
+// POINTER as its address, so a MemoryCache[*User] hashed its memory layout
+// instead of its contents: every process restart, and every reallocation,
+// produced a different hash and change detection reported a change that had
+// not happened. time.Time fields carry a monotonic reading under %v with the
+// same effect.
+//
+// Each record is length-prefixed. The previous encoding separated records with
+// "\n" without escaping, so a value containing a newline could produce the
+// same digest as a different set of values.
+//
+// Values that JSON cannot represent (channels, funcs, cycles, or types whose
+// identity lives in unexported fields) need a custom HashFunc; the fallback
+// below keeps such a cache working but inherits %v's limitations.
 func defaultHashFunc[V any](values []V) string {
 	if len(values) == 0 {
-		return sha256Hash("empty")
+		return emptyHash()
 	}
 
 	var sb strings.Builder
 	for _, v := range values {
-		fmt.Fprintf(&sb, "%v\n", v)
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			encoded = []byte(fmt.Sprintf("%v", v))
+		}
+		fmt.Fprintf(&sb, "%d:", len(encoded))
+		sb.Write(encoded)
 	}
 	return sha256Hash(sb.String())
 }
@@ -113,7 +149,12 @@ type RedisConfig struct {
 	OperationTimeout time.Duration
 
 	// MaxValueBytes limits the size of the value read from Redis in Get(). If <= 0, no limit is applied.
-	// Default: 16MB. Prevents OOM from malicious or corrupted oversized values in Redis.
+	// Default: 16MB.
+	//
+	// The size is checked with STRLEN before the value is fetched, so an
+	// oversized value is never pulled into memory. Checking len(data) after
+	// GET, as this used to, only prevented the unmarshal -- the allocation the
+	// limit exists to avoid had already happened.
 	MaxValueBytes int
 }
 

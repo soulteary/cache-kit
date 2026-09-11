@@ -108,12 +108,12 @@ func (c *MemoryCache[V]) Get(key string) (V, bool) {
 // Duplicate primary keys will be updated (last one wins).
 // Panics if PrimaryKeyFunc is nil and len(values) > 0; set PrimaryKeyFunc via config before use with non-empty data.
 func (c *MemoryCache[V]) Set(values []V) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if len(values) > 0 && c.config.PrimaryKeyFunc == nil {
 		panic("cache-kit: MultiIndexCache requires PrimaryKeyFunc when setting non-empty data; set it via config.WithPrimaryKey()")
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	// Clear existing data
 	c.data = make(map[string]V, len(values))
@@ -158,9 +158,19 @@ func (c *MemoryCache[V]) Set(values []V) {
 		// Update all indexes
 		for name, keyFunc := range c.indexFns {
 			indexKey := keyFunc(v)
-			if indexKey != "" {
-				c.indexes[name][c.normalizeKey(indexKey)] = pk
+			if indexKey == "" {
+				continue
 			}
+			normalized := c.normalizeKey(indexKey)
+			// Index keys are normalized (lower-cased, trimmed), so two values
+			// differing only in case collide here and the later one silently
+			// shadows the earlier -- a lookup by email could return a
+			// different user than the one asked for. Report it rather than
+			// letting it pass unnoticed.
+			if existing, clash := c.indexes[name][normalized]; clash && existing != pk && c.config.OnIndexConflict != nil {
+				c.config.OnIndexConflict(name, normalized, existing, pk)
+			}
+			c.indexes[name][normalized] = pk
 		}
 	}
 
@@ -200,7 +210,10 @@ func (c *MemoryCache[V]) Clear() {
 	for name := range c.indexes {
 		c.indexes[name] = make(map[string]string)
 	}
-	c.hash = ""
+	// Same state, same hash. Setting this to "" made Clear() and Set(nil)
+	// report two different hashes for an equally empty cache, so change
+	// detection saw a change that had not happened.
+	c.hash = c.calculateHash()
 }
 
 // GetHash returns a hash representing the current cache state.
@@ -213,16 +226,18 @@ func (c *MemoryCache[V]) GetHash() string {
 
 // Iterate applies a function to each cached value in insertion order.
 // If the function returns false, iteration stops.
-// The callback must not panic; if it does, the read lock may block other goroutines until recovery.
+//
+// The values are snapshotted under the read lock and the callback runs
+// without it held. Calling it under the lock deadlocked any callback that
+// touched the cache again -- Go's RWMutex is not reentrant, and a waiting
+// writer blocks further RLock attempts -- and a panicking callback left the
+// lock held. The trade-off is that the callback sees a snapshot rather than
+// live data, which is the same guarantee GetAll already gives.
 func (c *MemoryCache[V]) Iterate(fn func(value V) bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	for _, pk := range c.order {
-		if v, exists := c.data[pk]; exists {
-			if !fn(v) {
-				return
-			}
+	snapshot := c.GetAll()
+	for _, v := range snapshot {
+		if !fn(v) {
+			return
 		}
 	}
 }
@@ -255,6 +270,11 @@ func (c *MemoryCache[V]) calculateHash() string {
 }
 
 // normalizeKey normalizes an index key (lowercase, trimmed).
+//
+// Note that primary keys are NOT normalized: Get("ABC") and
+// GetByIndex(name, "ABC") therefore behave differently for the same string.
+// That asymmetry is longstanding and load-bearing for existing callers, so it
+// is documented rather than changed.
 func (c *MemoryCache[V]) normalizeKey(key string) string {
 	return strings.ToLower(strings.TrimSpace(key))
 }
