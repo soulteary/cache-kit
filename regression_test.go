@@ -154,7 +154,9 @@ func TestBoundedGetIsAtomic(t *testing.T) {
 
 	// Oversized value written behind the cache's back.
 	big := `[{"id":"1","name":"` + strings.Repeat("x", 512) + `"}]`
-	mr.Set(cfg.KeyPrefix+"data", big)
+	if err := mr.Set(cfg.KeyPrefix+"data", big); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := c.Get()
 	if err == nil {
