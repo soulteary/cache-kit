@@ -287,3 +287,80 @@ func TestIndexConflictCallbackCanReadTheCache(t *testing.T) {
 		t.Fatal("OnIndexConflict deadlocked reading the cache: it was called while Set held the lock")
 	}
 }
+
+// --- Codex review round 2 (PR #3) ---
+
+// hiddenState has an exported field kept out of the wire format, which is
+// exactly the shape the JSON-based hash could not see.
+type hiddenState struct {
+	ID       string
+	Password string `json:"-"`
+}
+
+// customMarshal hides part of its state behind MarshalJSON.
+type customMarshal struct {
+	ID     string
+	Secret string
+}
+
+func (c customMarshal) MarshalJSON() ([]byte, error) {
+	return []byte(`{"id":"` + c.ID + `"}`), nil
+}
+
+// TestHashCoversJSONHiddenState is the regression test for hashing with
+// json.Marshal. It honours `json:"-"` and custom MarshalJSON, so state
+// deliberately kept out of the wire format was also kept out of the hash: two
+// values differing only there are observably different through Get and GetAll
+// yet hashed identically, and a real change went undetected.
+func TestHashCoversJSONHiddenState(t *testing.T) {
+	tagged := defaultHashFunc([]hiddenState{{ID: "1", Password: "a"}})
+	taggedChanged := defaultHashFunc([]hiddenState{{ID: "1", Password: "b"}})
+	if tagged == taggedChanged {
+		t.Error(`a change to a json:"-" field did not change the hash`)
+	}
+
+	custom := defaultHashFunc([]customMarshal{{ID: "1", Secret: "a"}})
+	customChanged := defaultHashFunc([]customMarshal{{ID: "1", Secret: "b"}})
+	if custom == customChanged {
+		t.Error("a change hidden by MarshalJSON did not change the hash")
+	}
+
+	// Identical values still hash identically.
+	if defaultHashFunc([]hiddenState{{ID: "1", Password: "a"}}) != tagged {
+		t.Error("the hash is not stable for identical values")
+	}
+}
+
+// TestHashIsStableAndContentBased guards the properties the previous rounds
+// established: pointers hash by content, time.Time by instant, map order does
+// not matter, and distinct contents do not collide.
+func TestHashIsStableAndContentBased(t *testing.T) {
+	type inner struct {
+		Tags map[string]int
+		When time.Time
+	}
+	at := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
+
+	a := &inner{Tags: map[string]int{"x": 1, "y": 2}, When: at}
+	b := &inner{Tags: map[string]int{"y": 2, "x": 1}, When: at.Local()}
+
+	if defaultHashFunc([]*inner{a}) != defaultHashFunc([]*inner{b}) {
+		t.Error("two equal values hashed differently (map order, location or pointer identity leaked in)")
+	}
+
+	// A monotonic reading must not change the hash either.
+	now := time.Now()
+	if defaultHashFunc([]inner{{When: now}}) != defaultHashFunc([]inner{{When: now.Round(0)}}) {
+		t.Error("the monotonic clock reading changed the hash")
+	}
+
+	c := &inner{Tags: map[string]int{"x": 1, "y": 3}, When: at}
+	if defaultHashFunc([]*inner{a}) == defaultHashFunc([]*inner{c}) {
+		t.Error("different contents produced the same hash")
+	}
+
+	// Record boundaries: two values must not be confusable with one.
+	if defaultHashFunc([]string{"ab", "c"}) == defaultHashFunc([]string{"a", "bc"}) {
+		t.Error("record boundaries are not encoded; values can be shifted between records")
+	}
+}

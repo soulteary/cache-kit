@@ -3,8 +3,8 @@ package cache
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -17,7 +17,12 @@ type Config[V any] struct {
 	PrimaryKeyFunc KeyFunc[V]
 
 	// HashFunc computes a hash for the cache contents.
-	// If nil, defaultHashFunc is used, which serializes each value as JSON.
+	//
+	// If nil, defaultHashFunc is used. It walks values with reflection and
+	// covers every EXPORTED field regardless of json tags or a custom
+	// MarshalJSON, so state hidden from the wire format still participates in
+	// change detection. Types whose identity lives in unexported fields,
+	// channels or funcs need a HashFunc of their own.
 	//
 	// Warning: the default is not suitable for types containing sensitive
 	// fields (passwords, tokens), as those would be included in the hash
@@ -93,20 +98,28 @@ func emptyHash() string { return sha256Hash("empty") }
 
 // defaultHashFunc computes a content hash over the cached values.
 //
-// It serialises each value as JSON rather than with fmt's %v. %v prints a
-// POINTER as its address, so a MemoryCache[*User] hashed its memory layout
-// instead of its contents: every process restart, and every reallocation,
-// produced a different hash and change detection reported a change that had
-// not happened. time.Time fields carry a monotonic reading under %v with the
-// same effect.
+// It walks each value with reflection rather than using fmt's %v or
+// json.Marshal.
 //
-// Each record is length-prefixed. The previous encoding separated records with
-// "\n" without escaping, so a value containing a newline could produce the
-// same digest as a different set of values.
+// %v prints a POINTER as its address, so a MemoryCache[*User] hashed its
+// memory layout instead of its contents: every process restart, and every
+// reallocation, produced a different hash and change detection reported a
+// change that had not happened. time.Time carries a monotonic reading under
+// %v with the same effect.
 //
-// Values that JSON cannot represent (channels, funcs, cycles, or types whose
-// identity lives in unexported fields) need a custom HashFunc; the fallback
-// below keeps such a cache working but inherits %v's limitations.
+// json.Marshal fixed that but introduced a quieter problem: it honours
+// `json:"-"` and custom MarshalJSON, so state deliberately kept out of the
+// wire format was also kept out of the HASH. Two values differing only in an
+// exported `Password string `json:"-"“ field are observably different
+// through Get and GetAll yet hash identically, so a real change goes
+// undetected -- which is worse than a spurious one. The encoding below
+// includes every exported field whatever its tags say.
+//
+// Each field and element is length-prefixed, so no combination of values can
+// produce the same byte string as a different combination.
+//
+// Values whose identity lives in unexported fields, channels or funcs still
+// need a custom HashFunc; they contribute only their type here.
 func defaultHashFunc[V any](values []V) string {
 	if len(values) == 0 {
 		return emptyHash()
@@ -114,14 +127,111 @@ func defaultHashFunc[V any](values []V) string {
 
 	var sb strings.Builder
 	for _, v := range values {
-		encoded, err := json.Marshal(v)
-		if err != nil {
-			encoded = []byte(fmt.Sprintf("%v", v))
-		}
-		fmt.Fprintf(&sb, "%d:", len(encoded))
-		sb.Write(encoded)
+		encodeForHash(&sb, reflect.ValueOf(v))
+		sb.WriteByte(0x1e) // record separator
 	}
 	return sha256Hash(sb.String())
+}
+
+// timeType is compared against so time.Time hashes by instant rather than by
+// its internal representation, which carries a monotonic reading.
+var timeType = reflect.TypeOf(time.Time{})
+
+// encodeForHash writes a deterministic, length-prefixed encoding of v.
+func encodeForHash(sb *strings.Builder, v reflect.Value) {
+	if !v.IsValid() {
+		sb.WriteString("nil;")
+		return
+	}
+
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		// Follow the pointer: its ADDRESS is not content.
+		if v.IsNil() {
+			sb.WriteString("nil;")
+			return
+		}
+		encodeForHash(sb, v.Elem())
+
+	case reflect.Struct:
+		if v.Type() == timeType {
+			// Wall clock only, and in UTC: the monotonic reading and the
+			// location pointer are not content.
+			t := v.Interface().(time.Time)
+			fmt.Fprintf(sb, "t%d;", t.UTC().UnixNano())
+			return
+		}
+		t := v.Type()
+		sb.WriteString("{")
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath != "" {
+				continue // unexported: not readable, and not part of the API
+			}
+			// The field NAME is included so renaming or reordering fields
+			// cannot collide, and no json tag is consulted.
+			fmt.Fprintf(sb, "%d:%s=", len(f.Name), f.Name)
+			encodeForHash(sb, v.Field(i))
+		}
+		sb.WriteString("}")
+
+	case reflect.Slice, reflect.Array:
+		if v.Kind() == reflect.Slice && v.IsNil() {
+			sb.WriteString("nil;")
+			return
+		}
+		fmt.Fprintf(sb, "[%d", v.Len())
+		for i := 0; i < v.Len(); i++ {
+			sb.WriteByte(',')
+			encodeForHash(sb, v.Index(i))
+		}
+		sb.WriteString("]")
+
+	case reflect.Map:
+		if v.IsNil() {
+			sb.WriteString("nil;")
+			return
+		}
+		// Map iteration order is randomized, so the keys are sorted by their
+		// own encoding to keep the digest stable.
+		entries := make([]string, 0, v.Len())
+		for _, key := range v.MapKeys() {
+			var entry strings.Builder
+			encodeForHash(&entry, key)
+			entry.WriteByte('=')
+			encodeForHash(&entry, v.MapIndex(key))
+			entries = append(entries, entry.String())
+		}
+		sort.Strings(entries)
+		fmt.Fprintf(sb, "m%d", len(entries))
+		for _, e := range entries {
+			fmt.Fprintf(sb, ",%d:%s", len(e), e)
+		}
+
+	case reflect.String:
+		fmt.Fprintf(sb, "%d:%s;", len(v.String()), v.String())
+
+	case reflect.Bool:
+		fmt.Fprintf(sb, "b%t;", v.Bool())
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		fmt.Fprintf(sb, "i%d;", v.Int())
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		fmt.Fprintf(sb, "u%d;", v.Uint())
+
+	case reflect.Float32, reflect.Float64:
+		fmt.Fprintf(sb, "f%v;", v.Float())
+
+	case reflect.Complex64, reflect.Complex128:
+		fmt.Fprintf(sb, "c%v;", v.Complex())
+
+	default:
+		// Channels, funcs and anything else with no content to speak of.
+		// Only the TYPE contributes, so such a cache needs a custom HashFunc
+		// to detect changes.
+		fmt.Fprintf(sb, "?%s;", v.Type().String())
+	}
 }
 
 // sha256Hash computes SHA256 hash of a string.
