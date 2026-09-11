@@ -127,7 +127,12 @@ func defaultHashFunc[V any](values []V) string {
 
 	var sb strings.Builder
 	for _, v := range values {
-		encodeForHash(&sb, reflect.ValueOf(v))
+		rv := reflect.ValueOf(v)
+		// The CONCRETE type, stamped here because reflect.ValueOf unwraps an
+		// interface: when V is `any`, int(1) and int64(1) arrive as plain Int
+		// and Int64 kinds whose encodings are otherwise identical.
+		writeTypeTag(&sb, rv)
+		encodeForHash(&sb, rv)
 		sb.WriteByte(0x1e) // record separator
 	}
 	return sha256Hash(sb.String())
@@ -136,6 +141,22 @@ func defaultHashFunc[V any](values []V) string {
 // timeType is compared against so time.Time hashes by instant rather than by
 // its internal representation, which carries a monotonic reading.
 var timeType = reflect.TypeOf(time.Time{})
+
+// writeTypeTag records v's concrete type.
+//
+// It is written wherever the type would otherwise be invisible to the
+// encoding: at the top level and behind an interface, where the static type
+// says nothing, and for structs, whose field-by-field encoding two unrelated
+// types can share exactly. Elsewhere the static type is fixed by the
+// surrounding struct field, slice or map, so the tag would only cost bytes.
+func writeTypeTag(sb *strings.Builder, v reflect.Value) {
+	if !v.IsValid() {
+		sb.WriteString("<nil>")
+		return
+	}
+	name := v.Type().String()
+	fmt.Fprintf(sb, "<%d:%s>", len(name), name)
+}
 
 // encodeForHash writes a deterministic, length-prefixed encoding of v.
 func encodeForHash(sb *strings.Builder, v reflect.Value) {
@@ -151,17 +172,30 @@ func encodeForHash(sb *strings.Builder, v reflect.Value) {
 			sb.WriteString("nil;")
 			return
 		}
+		if v.Kind() == reflect.Interface {
+			// What the interface HOLDS is content. Following it blind made
+			// any(int(1)) and any(int64(1)) -- and any two struct types with
+			// the same exported shape -- encode identically, so swapping one
+			// for the other left GetHash() unchanged.
+			writeTypeTag(sb, v.Elem())
+		}
 		encodeForHash(sb, v.Elem())
 
 	case reflect.Struct:
 		if v.Type() == timeType {
 			// Wall clock only, and in UTC: the monotonic reading and the
 			// location pointer are not content.
+			// Seconds plus nanoseconds, never UnixNano: that is undefined
+			// outside 1678..2262, and it wraps modulo 2^64, so two instants
+			// 584.9 years apart encoded identically and the same instant
+			// could encode differently on another implementation. Unix() is
+			// valid across the whole range.
 			t := v.Interface().(time.Time)
-			fmt.Fprintf(sb, "t%d;", t.UTC().UnixNano())
+			fmt.Fprintf(sb, "t%d.%09d;", t.UTC().Unix(), t.Nanosecond())
 			return
 		}
 		t := v.Type()
+		writeTypeTag(sb, v)
 		sb.WriteString("{")
 		for i := 0; i < t.NumField(); i++ {
 			f := t.Field(i)
@@ -194,12 +228,18 @@ func encodeForHash(sb *strings.Builder, v reflect.Value) {
 		}
 		// Map iteration order is randomized, so the keys are sorted by their
 		// own encoding to keep the digest stable.
+		//
+		// MapRange, not MapKeys plus MapIndex: a NaN float or complex key is
+		// returned by MapKeys but is not equal to itself, so MapIndex(key)
+		// comes back invalid and its value was encoded as "nil;" -- changing
+		// that value alone left GetHash() unchanged. The iterator keeps each
+		// value paired with its key.
 		entries := make([]string, 0, v.Len())
-		for _, key := range v.MapKeys() {
+		for iter := v.MapRange(); iter.Next(); {
 			var entry strings.Builder
-			encodeForHash(&entry, key)
+			encodeForHash(&entry, iter.Key())
 			entry.WriteByte('=')
-			encodeForHash(&entry, v.MapIndex(key))
+			encodeForHash(&entry, iter.Value())
 			entries = append(entries, entry.String())
 		}
 		sort.Strings(entries)

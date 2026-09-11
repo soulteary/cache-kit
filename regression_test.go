@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -362,5 +363,102 @@ func TestHashIsStableAndContentBased(t *testing.T) {
 	// Record boundaries: two values must not be confusable with one.
 	if defaultHashFunc([]string{"ab", "c"}) == defaultHashFunc([]string{"a", "bc"}) {
 		t.Error("record boundaries are not encoded; values can be shifted between records")
+	}
+}
+
+// TestHashDistinguishesConcreteTypes is the regression test for following an
+// interface without recording what it held. any(int(1)) and any(int64(1)) are
+// observably different through Get and GetAll but encoded identically, as did
+// two unrelated struct types with the same exported shape -- so swapping one
+// for the other left GetHash() unchanged.
+func TestHashDistinguishesConcreteTypes(t *testing.T) {
+	type shapeA struct{ Name string }
+	type shapeB struct{ Name string }
+
+	t.Run("scalars behind any", func(t *testing.T) {
+		if defaultHashFunc([]any{int(1)}) == defaultHashFunc([]any{int64(1)}) {
+			t.Error("any(int(1)) and any(int64(1)) hash the same")
+		}
+		if defaultHashFunc([]any{int32(1)}) == defaultHashFunc([]any{uint32(1)}) {
+			t.Error("any(int32(1)) and any(uint32(1)) hash the same")
+		}
+		if defaultHashFunc([]any{"1"}) == defaultHashFunc([]any{[]byte("1")}) {
+			t.Error(`any("1") and any([]byte("1")) hash the same`)
+		}
+	})
+
+	t.Run("struct types with one shape", func(t *testing.T) {
+		if defaultHashFunc([]any{shapeA{Name: "x"}}) == defaultHashFunc([]any{shapeB{Name: "x"}}) {
+			t.Error("two struct types with the same exported shape hash the same")
+		}
+	})
+
+	t.Run("in an any-typed field", func(t *testing.T) {
+		type holder struct{ V any }
+		if defaultHashFunc([]holder{{V: int(1)}}) == defaultHashFunc([]holder{{V: int64(1)}}) {
+			t.Error("an any field holding int(1) and int64(1) hashes the same")
+		}
+	})
+
+	// Identical values still agree.
+	if defaultHashFunc([]any{int64(1)}) != defaultHashFunc([]any{int64(1)}) {
+		t.Error("the hash is not stable for identical values")
+	}
+}
+
+// TestHashCoversTimesOutsideTheUnixNanoRange is the regression test for
+// encoding time.Time with UnixNano, which is undefined before 1678 and after
+// 2262. The zero time is one such value, so distinct instants could encode
+// alike and the same instant could encode differently elsewhere.
+func TestHashCoversTimesOutsideTheUnixNanoRange(t *testing.T) {
+	type holder struct{ When time.Time }
+
+	var zero time.Time
+	far := time.Date(2600, 1, 1, 0, 0, 0, 0, time.UTC)
+	farPlus := far.Add(time.Hour)
+	old := time.Date(1600, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// UnixNano wraps modulo 2^64, so two instants exactly 2^64 nanoseconds --
+	// about 584.9 years -- apart produce the SAME value. One of these is
+	// inside the representable window and the other is not.
+	wrapA := time.Date(1800, 1, 1, 0, 0, 0, 0, time.UTC)
+	wrapB := wrapA.Add(time.Duration(math.MaxInt64)).Add(time.Duration(math.MaxInt64)).Add(2)
+
+	for _, tc := range []struct {
+		name string
+		a, b time.Time
+	}{
+		{"instants 2^64ns apart, indistinguishable to UnixNano", wrapA, wrapB},
+		{"zero vs a far future instant", zero, far},
+		{"two far future instants", far, farPlus},
+		{"a pre-1678 instant vs the zero time", old, zero},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if defaultHashFunc([]holder{{When: tc.a}}) == defaultHashFunc([]holder{{When: tc.b}}) {
+				t.Errorf("%s and %s hash the same", tc.a, tc.b)
+			}
+		})
+	}
+
+	// Equal instants in different locations still agree.
+	at := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
+	if defaultHashFunc([]holder{{When: at}}) != defaultHashFunc([]holder{{When: at.Local()}}) {
+		t.Error("the same instant in two locations hashed differently")
+	}
+}
+
+// TestHashCoversValuesUnderNaNMapKeys is the regression test for reading map
+// values with MapIndex. MapKeys returns a NaN key, but NaN is not equal to
+// itself, so MapIndex(key) came back invalid and the value was encoded as
+// "nil;" -- changing only that value left GetHash() unchanged.
+func TestHashCoversValuesUnderNaNMapKeys(t *testing.T) {
+	type holder struct{ M map[float64]string }
+	nan := math.NaN()
+
+	a := holder{M: map[float64]string{nan: "before"}}
+	b := holder{M: map[float64]string{nan: "after"}}
+
+	if defaultHashFunc([]holder{a}) == defaultHashFunc([]holder{b}) {
+		t.Error("changing the value stored under a NaN key did not change the hash")
 	}
 }
