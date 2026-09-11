@@ -400,8 +400,10 @@ func TestHashDistinguishesConcreteTypes(t *testing.T) {
 		}
 	})
 
-	// Identical values still agree.
-	if defaultHashFunc([]any{int64(1)}) != defaultHashFunc([]any{int64(1)}) {
+	// Identical values still agree. The second slice is built separately so
+	// staticcheck does not read this as comparing one expression with itself.
+	var boxed any = int64(1)
+	if defaultHashFunc([]any{int64(1)}) != defaultHashFunc([]any{boxed}) {
 		t.Error("the hash is not stable for identical values")
 	}
 }
