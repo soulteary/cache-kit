@@ -743,6 +743,42 @@ func TestNestedInterfaceKeepsEmbeddedTime(t *testing.T) {
 	}
 }
 
+// TestTimeKeyedMapsAreNotFullyDistinguished pins the same LIMIT for time.Time
+// keys, which reach it by a less obvious route.
+//
+// time.Time's == compares the *Location POINTER and the monotonic reading, not
+// just the instant, so t.UTC() and t.In(time.FixedZone("z", 0)) are distinct
+// keys that coexist in one map. Encoding the zone name and offset would
+// separate that pair, but not two separately-built FixedZone("z", 0) values:
+// identical in name and offset, indistinguishable by content, still unequal to
+// Go. A location pointer and a monotonic reading are both process-local, so a
+// reproducible hash cannot follow them -- the same wall the pointer keys hit.
+func TestTimeKeyedMapsAreNotFullyDistinguished(t *testing.T) {
+	utc := time.Unix(1700000000, 0).UTC()
+	zoned := utc.In(time.FixedZone("z", 0))
+
+	if utc == zoned {
+		t.Fatal("the two keys are equal; the test proves nothing")
+	}
+	if len(map[time.Time]string{utc: "x", zoned: "y"}) != 2 {
+		t.Fatal("the two keys did not coexist; the test proves nothing")
+	}
+
+	if defaultHashFunc([]any{map[time.Time]string{utc: "x", zoned: "y"}}) !=
+		defaultHashFunc([]any{map[time.Time]string{utc: "y", zoned: "x"}}) {
+		t.Error("time.Time keys are now distinguished -- confirm the digest is still identical " +
+			"across separate runs, and across two separately-built FixedZone(\"z\", 0) values")
+	}
+
+	// The part that must keep working: as a VALUE, one instant is one instant
+	// whatever zone it is expressed in. That is what change detection wants,
+	// and it is why the key case cannot simply adopt Go's equality.
+	if defaultHashFunc([]any{struct{ At time.Time }{utc}}) !=
+		defaultHashFunc([]any{struct{ At time.Time }{zoned}}) {
+		t.Error("the same instant in two zones hashed differently as a value")
+	}
+}
+
 // TestPointerKeyedMapsAreNotFullyDistinguished pins a LIMIT, not a bug.
 //
 // Go compares map keys by identity, so two distinct *int both addressing 1 are

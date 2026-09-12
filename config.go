@@ -49,6 +49,15 @@ type Config[V any] struct {
 	// but make the digest differ between runs of the same program, which is
 	// the one thing this hash must never do. A type that relies on pointer
 	// identity in map keys needs a HashFunc of its own.
+	//
+	// time.Time KEYS are the same case, less obviously: its == compares the
+	// *Location POINTER and the monotonic reading, not just the instant. So
+	// t.UTC() and t.In(time.FixedZone("z", 0)) are two distinct keys that can
+	// coexist in one map, and even two separately-built FixedZone("z", 0)
+	// values -- identical in name and offset, so indistinguishable by content
+	// -- compare unequal. Both a location pointer and a monotonic reading are
+	// process-local, so a reproducible hash cannot follow them either. Maps
+	// keyed by time.Time, at any depth, need a HashFunc of their own.
 	HashFunc HashFunc[V]
 
 	// ValidateFunc validates a value before storing.
