@@ -757,8 +757,14 @@ func TestTimeKeyedMapsAreNotFullyDistinguished(t *testing.T) {
 	utc := time.Unix(1700000000, 0).UTC()
 	zoned := utc.In(time.FixedZone("z", 0))
 
-	if utc == zoned {
-		t.Fatal("the two keys are equal; the test proves nothing")
+	// Asked as "do these index the same map slot?", which is the question the
+	// test is actually about -- and avoids time.Time's == entirely, since
+	// Equal would call these two the SAME and lose the distinction.
+	sameKey := func(a, b time.Time) bool {
+		return map[time.Time]bool{a: true}[b]
+	}
+	if sameKey(utc, zoned) {
+		t.Fatal("the two keys index the same slot; the test proves nothing")
 	}
 	if len(map[time.Time]string{utc: "x", zoned: "y"}) != 2 {
 		t.Fatal("the two keys did not coexist; the test proves nothing")
