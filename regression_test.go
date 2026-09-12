@@ -9,6 +9,9 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+
+	alphafoo "github.com/soulteary/cache-kit/internal/hashtypes/alpha/foo"
+	betafoo "github.com/soulteary/cache-kit/internal/hashtypes/beta/foo"
 )
 
 type user struct {
@@ -552,5 +555,115 @@ func TestTypeTagsUseTheImportPath(t *testing.T) {
 	// Unnamed types have no path and fall back to the structural spelling.
 	if got := typeName(reflect.TypeOf([]int{})); got != "[]int" {
 		t.Errorf("typeName([]int) = %q, want []int", got)
+	}
+}
+
+// --- Codex review round 6 (PR #3) ---
+
+type hashInner struct{ ID string }
+
+// hashOuterPtr embeds a POINTER to an unexported struct. Go promotes its
+// fields exactly as it does for a value embed, so v.ID reads here too.
+type hashOuterPtr struct{ *hashInner }
+
+// TestPromotedFieldsThroughPointerEmbedding is the regression test for the
+// promoted-field traversal testing only for Kind() == Struct.
+//
+// An anonymous *hashInner has Kind() == Pointer, so the encoder skipped the
+// embed entirely and two values differing only in the promoted v.ID -- public
+// state every caller can read -- produced the same hash.
+func TestPromotedFieldsThroughPointerEmbedding(t *testing.T) {
+	a := defaultHashFunc([]any{hashOuterPtr{&hashInner{ID: "a"}}})
+	b := defaultHashFunc([]any{hashOuterPtr{&hashInner{ID: "b"}}})
+	if a == b {
+		t.Errorf("a change to a field promoted through a pointer embed did not change the hash (%s)", a)
+	}
+
+	// A nil embed is distinct from a populated one, and does not panic.
+	nilEmbed := defaultHashFunc([]any{hashOuterPtr{}})
+	if nilEmbed == a || nilEmbed == b {
+		t.Error("a nil pointer embed hashed the same as a populated one")
+	}
+}
+
+type hiddenTime = time.Time
+
+// hashOuterTime embeds an unexported ALIAS of time.Time, so time.Time's
+// methods are promoted and the instant is ordinary public state.
+type hashOuterTime struct {
+	hiddenTime
+	Name string
+}
+
+// TestEmbeddedTimeAliasDoesNotPanic is the regression test for calling
+// Interface() on a value reached through an unexported embedded field.
+//
+// reflect marks such a value read-only and Interface() panics on it, so the
+// round-5 promoted-field traversal turned this shape into a panic inside Set
+// -- a crash, not a wrong hash.
+func TestEmbeddedTimeAliasDoesNotPanic(t *testing.T) {
+	first := time.Unix(1700000000, 123)
+	second := time.Unix(1800000000, 456)
+
+	var a, b string
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("hashing an embedded time alias panicked: %v", r)
+			}
+		}()
+		a = defaultHashFunc([]any{hashOuterTime{first, "n"}})
+		b = defaultHashFunc([]any{hashOuterTime{second, "n"}})
+	}()
+
+	if a == b {
+		t.Error("two different embedded instants hashed the same")
+	}
+
+	// The instant is read, not approximated: the same instant in another
+	// location and carrying a monotonic reading must still hash alike.
+	utc := defaultHashFunc([]any{hashOuterTime{first.UTC(), "n"}})
+	if utc != a {
+		t.Error("the same embedded instant hashed differently across locations")
+	}
+}
+
+// TestCompoundTypeTagsQualifyNamedComponents is the regression test for
+// reflect.Type.String() being used as the fallback spelling.
+//
+// String() shortens package names inside compound types too, so two
+// dependencies both named "foo" at different import paths, each declaring
+// `type ID int`, made struct{ X foo.ID } spell identically for either -- and
+// since the field is then encoded as its integer value, equal values hashed
+// alike despite having different concrete types.
+func TestCompoundTypeTagsQualifyNamedComponents(t *testing.T) {
+	alphaValue := struct{ X alphafoo.ID }{1}
+	betaValue := struct{ X betafoo.ID }{1}
+
+	// The premise: the two types are distinct but spell the same.
+	alphaType := reflect.TypeOf(alphaValue)
+	betaType := reflect.TypeOf(betaValue)
+	if alphaType == betaType {
+		t.Fatal("the two struct types are identical; the test proves nothing")
+	}
+	if alphaType.String() != betaType.String() {
+		t.Skipf("reflect no longer shortens these alike (%s vs %s)", alphaType, betaType)
+	}
+
+	if a, b := defaultHashFunc([]any{alphaValue}), defaultHashFunc([]any{betaValue}); a == b {
+		t.Errorf("two distinct struct types with equal values hashed alike (%s)", a)
+	}
+
+	// Through the encoder's own entry point, not typeName directly.
+	var sb strings.Builder
+	writeTypeTag(&sb, reflect.ValueOf([]alphafoo.ID{1}))
+	if !strings.Contains(sb.String(), "internal/hashtypes/alpha/foo.ID") {
+		t.Errorf("the tag for []foo.ID is %q, want the component's import path", sb.String())
+	}
+
+	sb.Reset()
+	writeTypeTag(&sb, reflect.ValueOf(map[alphafoo.ID]alphafoo.ID{1: 2}))
+	if !strings.Contains(sb.String(), "internal/hashtypes/alpha/foo.ID") {
+		t.Errorf("the tag for map[foo.ID]foo.ID is %q, want the component's import path", sb.String())
 	}
 }

@@ -7,8 +7,10 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 )
 
 // Config holds configuration for the cache.
@@ -128,7 +130,7 @@ func defaultHashFunc[V any](values []V) string {
 
 	var sb strings.Builder
 	for _, v := range values {
-		rv := reflect.ValueOf(v)
+		rv := addressableCopy(reflect.ValueOf(v))
 		// The CONCRETE type, stamped here because reflect.ValueOf unwraps an
 		// interface: when V is `any`, int(1) and int64(1) arrive as plain Int
 		// and Int64 kinds whose encodings are otherwise identical.
@@ -142,6 +144,41 @@ func defaultHashFunc[V any](values []V) string {
 // timeType is compared against so time.Time hashes by instant rather than by
 // its internal representation, which carries a monotonic reading.
 var timeType = reflect.TypeOf(time.Time{})
+
+// addressableCopy returns an addressable copy of v.
+//
+// Addressability is what lets readableValue recover a value the encoder
+// reached through an unexported embedded field. reflect.ValueOf is never
+// addressable, so the copy is made once, at the root, and every field reached
+// from it inherits the property.
+func addressableCopy(v reflect.Value) reflect.Value {
+	if !v.IsValid() {
+		return v
+	}
+	copied := reflect.New(v.Type()).Elem()
+	copied.Set(v)
+	return copied
+}
+
+// readableValue returns a value equivalent to v that Interface() accepts.
+//
+// A value reached through an unexported EMBEDDED field carries reflect's
+// read-only flag, and Interface() panics on it -- so
+//
+//	type hiddenTime = time.Time
+//	type Outer struct { hiddenTime }
+//
+// panicked inside Set, even though time.Time's methods are promoted and
+// Outer's instant is ordinary public state. Reading it back through its own
+// address is the standard way to drop the flag, and it is sound here because
+// the value is only ever READ. (A promoted exported FIELD needs none of this:
+// reflect already clears the flag for those.)
+func readableValue(v reflect.Value) reflect.Value {
+	if v.CanInterface() || !v.CanAddr() {
+		return v
+	}
+	return reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem()
+}
 
 // writeTypeTag records v's concrete type.
 //
@@ -173,7 +210,113 @@ func typeName(t reflect.Type) string {
 		}
 		return name
 	}
-	return t.String()
+
+	// Unnamed COMPOUND types are spelled out from their components, each
+	// qualified by this same function. reflect.Type.String() shortens package
+	// names inside them too, so with two dependencies named "foo" at
+	// different import paths each declaring `type ID int`, the distinct types
+	// struct{ X foo1.ID } and struct{ X foo2.ID } both rendered
+	// "struct { X foo.ID }" -- and since the field is encoded as its integer
+	// value, equal values then hashed alike.
+	switch t.Kind() {
+	case reflect.Pointer:
+		return "*" + typeName(t.Elem())
+	case reflect.Slice:
+		return "[]" + typeName(t.Elem())
+	case reflect.Array:
+		return "[" + strconv.Itoa(t.Len()) + "]" + typeName(t.Elem())
+	case reflect.Map:
+		return "map[" + typeName(t.Key()) + "]" + typeName(t.Elem())
+	case reflect.Chan:
+		return t.ChanDir().String() + " " + typeName(t.Elem())
+	case reflect.Func:
+		return funcTypeName(t)
+	case reflect.Struct:
+		return structTypeName(t)
+	case reflect.Interface:
+		return interfaceTypeName(t)
+	default:
+		// Every remaining unnamed kind is a predeclared type, whose String()
+		// is already unambiguous.
+		return t.String()
+	}
+}
+
+func funcTypeName(t reflect.Type) string {
+	var sb strings.Builder
+	sb.WriteString("func(")
+	for i := 0; i < t.NumIn(); i++ {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		if t.IsVariadic() && i == t.NumIn()-1 {
+			sb.WriteString("..." + typeName(t.In(i).Elem()))
+			continue
+		}
+		sb.WriteString(typeName(t.In(i)))
+	}
+	sb.WriteString(")(")
+	for i := 0; i < t.NumOut(); i++ {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(typeName(t.Out(i)))
+	}
+	sb.WriteString(")")
+	return sb.String()
+}
+
+func structTypeName(t reflect.Type) string {
+	var sb strings.Builder
+	sb.WriteString("struct{")
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if i > 0 {
+			sb.WriteString("; ")
+		}
+		if f.Anonymous {
+			sb.WriteString("=")
+		}
+		// The declaring package is part of an unexported field's identity:
+		// two packages can each declare `struct{ id int }` and the types are
+		// not the same.
+		if f.PkgPath != "" {
+			sb.WriteString(f.PkgPath + ".")
+		}
+		fmt.Fprintf(&sb, "%s %s", f.Name, typeName(f.Type))
+		if f.Tag != "" {
+			fmt.Fprintf(&sb, " %q", string(f.Tag))
+		}
+	}
+	sb.WriteString("}")
+	return sb.String()
+}
+
+func interfaceTypeName(t reflect.Type) string {
+	var sb strings.Builder
+	sb.WriteString("interface{")
+	// reflect reports interface methods in sorted order, so this is stable.
+	for i := 0; i < t.NumMethod(); i++ {
+		m := t.Method(i)
+		if i > 0 {
+			sb.WriteString("; ")
+		}
+		if m.PkgPath != "" {
+			sb.WriteString(m.PkgPath + ".")
+		}
+		sb.WriteString(m.Name + strings.TrimPrefix(typeName(m.Type), "func"))
+	}
+	sb.WriteString("}")
+	return sb.String()
+}
+
+// promotesFields reports whether an anonymous field of type t promotes its
+// own fields to the embedding struct: a struct, or a pointer to one.
+func promotesFields(t reflect.Type) bool {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return t.Kind() == reflect.Struct
 }
 
 // encodeForHash writes a deterministic, length-prefixed encoding of v.
@@ -208,7 +351,14 @@ func encodeForHash(sb *strings.Builder, v reflect.Value) {
 			// 584.9 years apart encoded identically and the same instant
 			// could encode differently on another implementation. Unix() is
 			// valid across the whole range.
-			t := v.Interface().(time.Time)
+			rv := readableValue(v)
+			if !rv.CanInterface() {
+				// Unreachable with an addressable root, but a cache key must
+				// never panic: encode the type and give up on the instant.
+				sb.WriteString("t?;")
+				return
+			}
+			t := rv.Interface().(time.Time)
 			fmt.Fprintf(sb, "t%d.%09d;", t.UTC().Unix(), t.Nanosecond())
 			return
 		}
@@ -223,7 +373,11 @@ func encodeForHash(sb *strings.Builder, v reflect.Value) {
 				// public type embedding an unexported struct exposes v.ID to
 				// every caller, and skipping the whole embed meant a value
 				// differing only there hashed the same.
-				if !f.Anonymous || f.Type.Kind() != reflect.Struct {
+				//
+				// A POINTER to a struct promotes its fields too, so
+				// `struct{ *inner }` reads v.ID exactly as `struct{ inner }`
+				// does; testing only for Kind() == Struct skipped it.
+				if !f.Anonymous || !promotesFields(f.Type) {
 					continue
 				}
 				fmt.Fprintf(sb, "%d:%s=", len(f.Name), f.Name)
