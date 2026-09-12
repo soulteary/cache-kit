@@ -667,3 +667,78 @@ func TestCompoundTypeTagsQualifyNamedComponents(t *testing.T) {
 		t.Errorf("the tag for map[foo.ID]foo.ID is %q, want the component's import path", sb.String())
 	}
 }
+
+// --- Codex review round 7 (PR #3) ---
+
+// TestEmbeddedTimeThroughContainers is the regression test for the addressable
+// copy being taken only at the root.
+//
+// Addressability propagates through struct fields, pointer dereferences and
+// slice elements, but two containers break the chain: the dynamic value behind
+// an interface and a map value are never addressable. readableValue then had
+// nothing to work with, so an unexported embedded time.Time reached through an
+// `any` field or a map value encoded as the constant "t?;" -- and two
+// different instants, both publicly readable through the promoted methods,
+// hashed alike.
+func TestEmbeddedTimeThroughContainers(t *testing.T) {
+	first := time.Unix(1700000000, 123)
+	second := time.Unix(1800000000, 456)
+
+	type container struct {
+		Any   any
+		Map   map[string]hashOuterTime
+		Slice []hashOuterTime
+		Ptr   *hashOuterTime
+	}
+
+	for _, tc := range []struct {
+		name       string
+		with       func(time.Time) container
+		wantDiffer bool
+	}{
+		{"interface field", func(at time.Time) container {
+			return container{Any: hashOuterTime{at, "n"}}
+		}, true},
+		{"map value", func(at time.Time) container {
+			return container{Map: map[string]hashOuterTime{"k": {at, "n"}}}
+		}, true},
+		{"map key", func(at time.Time) container {
+			return container{Any: map[hashOuterTime]string{{at, "n"}: "v"}}
+		}, true},
+		// These two were already fine; they guard against a fix that trades
+		// one path for another.
+		{"slice element", func(at time.Time) container {
+			return container{Slice: []hashOuterTime{{at, "n"}}}
+		}, true},
+		{"pointer", func(at time.Time) container {
+			return container{Ptr: &hashOuterTime{at, "n"}}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := defaultHashFunc([]any{tc.with(first)})
+			b := defaultHashFunc([]any{tc.with(second)})
+			if (a != b) != tc.wantDiffer {
+				t.Errorf("hashes differ = %v, want %v: the embedded instant was lost through this container", a != b, tc.wantDiffer)
+			}
+
+			// And the instant is READ, not approximated: the same instant in
+			// another location still hashes alike.
+			if utc := defaultHashFunc([]any{tc.with(first.UTC())}); utc != a {
+				t.Error("the same embedded instant hashed differently across locations")
+			}
+		})
+	}
+}
+
+// TestNestedInterfaceKeepsEmbeddedTime: the chain has to survive more than one
+// container hop.
+func TestNestedInterfaceKeepsEmbeddedTime(t *testing.T) {
+	build := func(at time.Time) any {
+		return map[string]any{"outer": []any{hashOuterTime{at, "n"}}}
+	}
+	a := defaultHashFunc([]any{build(time.Unix(1700000000, 0))})
+	b := defaultHashFunc([]any{build(time.Unix(1800000000, 0))})
+	if a == b {
+		t.Error("an embedded instant behind map -> interface -> slice -> interface hashed the same")
+	}
+}

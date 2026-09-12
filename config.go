@@ -160,6 +160,25 @@ func addressableCopy(v reflect.Value) reflect.Value {
 	return copied
 }
 
+// addressable returns an addressable equivalent of v when one can be made.
+//
+// An addressable copy at the ROOT is not enough. Addressability propagates
+// through struct fields, pointer dereferences and slice elements, but two
+// containers break the chain: the dynamic value behind an interface and a map
+// value are never addressable. Descending into either left readableValue with
+// nothing to work with, so an unexported embedded time.Time reached through an
+// `any` field or a map value encoded as the constant "t?;" and two different
+// instants hashed alike.
+//
+// Copying requires reading, so a value that is already read-only AND
+// unaddressable is returned unchanged; the encoder's own guard handles it.
+func addressable(v reflect.Value) reflect.Value {
+	if !v.IsValid() || v.CanAddr() || !v.CanInterface() {
+		return v
+	}
+	return addressableCopy(v)
+}
+
 // readableValue returns a value equivalent to v that Interface() accepts.
 //
 // A value reached through an unexported EMBEDDED field carries reflect's
@@ -340,7 +359,11 @@ func encodeForHash(sb *strings.Builder, v reflect.Value) {
 			// for the other left GetHash() unchanged.
 			writeTypeTag(sb, v.Elem())
 		}
-		encodeForHash(sb, v.Elem())
+		// addressable: an interface's dynamic value is never addressable, and
+		// a pointer's target always is, so this only costs a copy on the
+		// interface path -- where it is what keeps an embedded instant
+		// readable further down.
+		encodeForHash(sb, addressable(v.Elem()))
 
 	case reflect.Struct:
 		if v.Type() == timeType {
@@ -419,9 +442,10 @@ func encodeForHash(sb *strings.Builder, v reflect.Value) {
 		entries := make([]string, 0, v.Len())
 		for iter := v.MapRange(); iter.Next(); {
 			var entry strings.Builder
-			encodeForHash(&entry, iter.Key())
+			// Map keys and values are never addressable either.
+			encodeForHash(&entry, addressable(iter.Key()))
 			entry.WriteByte('=')
-			encodeForHash(&entry, iter.Value())
+			encodeForHash(&entry, addressable(iter.Value()))
 			entries = append(entries, entry.String())
 		}
 		sort.Strings(entries)
