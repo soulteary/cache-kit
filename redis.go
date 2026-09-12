@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -79,6 +80,11 @@ func NewRedisCacheWithKey[V any](client *redis.Client, key string, config *Redis
 }
 
 // getContext creates a context with timeout.
+//
+// NOTE: this is rooted at context.Background, so a caller's cancellation and
+// trace context do not reach Redis. Every method here takes no context
+// parameter, so fixing that means changing the exported signatures; it is
+// called out rather than changed.
 func (c *RedisCache[V]) getContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), c.config.OperationTimeout)
 }
@@ -114,10 +120,19 @@ func (c *RedisCache[V]) Set(values []V) error {
 	defer cancel()
 
 	ttl := c.effectiveTTL(c.config.TTL)
-	pipe := c.client.Pipeline()
+	// TxPipeline (MULTI/EXEC), not Pipeline: a plain pipeline is only batching,
+	// so two concurrent writers could interleave and leave the data from one
+	// paired with the version from the other -- which defeats the point of
+	// having a version at all.
+	//
+	// The version key is deliberately NOT given a TTL. Expiring it reset the
+	// counter to zero, so a consumer comparing "is the version higher than what
+	// I last saw" would stop refreshing after the reset. It is a single
+	// integer; Clear removes it explicitly.
+	pipe := c.client.TxPipeline()
 	pipe.Set(ctx, c.key, data, ttl)
 	pipe.Incr(ctx, c.versionKey())
-	pipe.Expire(ctx, c.versionKey(), ttl)
+	pipe.Persist(ctx, c.versionKey())
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {
@@ -138,17 +153,19 @@ func (c *RedisCache[V]) Get() ([]V, error) {
 	ctx, cancel := c.getContext()
 	defer cancel()
 
-	data, err := c.client.Get(ctx, c.key).Bytes()
-	if err == redis.Nil {
-		return []V{}, nil
-	}
+	// Measure and fetch ATOMICALLY. Reading the value and then measuring it
+	// does not prevent the allocation the limit exists to prevent -- by the
+	// time len(data) can be compared, the oversized value is already in
+	// memory. Measuring first with a separate STRLEN has the opposite
+	// problem: another writer can replace the key between the two commands,
+	// so the value that arrives can exceed the limit anyway. The script does
+	// both in one round trip, under Redis's single-threaded execution.
+	data, err := c.getBounded(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get cache: %w", err)
+		return nil, err
 	}
-
-	maxBytes := c.config.MaxValueBytes
-	if maxBytes > 0 && len(data) > maxBytes {
-		return nil, fmt.Errorf("cache value size %d exceeds max allowed %d", len(data), maxBytes)
+	if data == nil {
+		return []V{}, nil
 	}
 
 	var values []V
@@ -207,7 +224,7 @@ func (c *RedisCache[V]) Clear() error {
 	ctx, cancel := c.getContext()
 	defer cancel()
 
-	pipe := c.client.Pipeline()
+	pipe := c.client.TxPipeline()
 	pipe.Del(ctx, c.key)
 	pipe.Del(ctx, c.versionKey())
 	_, err := pipe.Exec(ctx)
@@ -229,10 +246,11 @@ func (c *RedisCache[V]) SetWithTTL(values []V, ttl time.Duration) error {
 	defer cancel()
 
 	effectiveTTL := c.effectiveTTL(ttl)
-	pipe := c.client.Pipeline()
+	// See Set: atomic, and the version key outlives the data.
+	pipe := c.client.TxPipeline()
 	pipe.Set(ctx, c.key, data, effectiveTTL)
 	pipe.Incr(ctx, c.versionKey())
-	pipe.Expire(ctx, c.versionKey(), effectiveTTL)
+	pipe.Persist(ctx, c.versionKey())
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {
@@ -271,7 +289,13 @@ func (c *RedisCache[V]) Refresh() error {
 	ttl := c.effectiveTTL(c.config.TTL)
 	pipe := c.client.Pipeline()
 	pipe.Expire(ctx, c.key, ttl)
-	pipe.Expire(ctx, c.versionKey(), ttl)
+	// The version key stays persistent, as Set leaves it. Expiring it here
+	// meant any cache that gets refreshed lost its version once the TTL
+	// elapsed; the next Set then restarted the counter at 1, and a consumer
+	// that had already observed a higher version stopped seeing updates --
+	// exactly the reset Set was changed to prevent. Persist also repairs a
+	// version key written by an earlier version of this package.
+	pipe.Persist(ctx, c.versionKey())
 
 	_, err := pipe.Exec(ctx)
 	return err
@@ -340,4 +364,62 @@ func (c *HybridCache[V]) Memory() *MemoryCache[V] {
 // Redis returns the underlying Redis cache for direct access.
 func (c *HybridCache[V]) Redis() *RedisCache[V] {
 	return c.redis
+}
+
+// boundedGetScript measures a key and returns its value in one atomic step.
+//
+// ARGV[1] is the byte limit; 0 means unlimited. The reply is a two-element
+// array: {"ok", value}, {"missing", ""} or {"toolarge", size}.
+var boundedGetScript = redis.NewScript(`
+local limit = tonumber(ARGV[1])
+if limit > 0 then
+  local size = redis.call('STRLEN', KEYS[1])
+  if size > limit then
+    return {'toolarge', tostring(size)}
+  end
+end
+local value = redis.call('GET', KEYS[1])
+if value == false then
+  return {'missing', ''}
+end
+return {'ok', value}
+`)
+
+// getBounded fetches the cache value, refusing one over MaxValueBytes.
+//
+// It returns (nil, nil) when the key does not exist.
+func (c *RedisCache[V]) getBounded(ctx context.Context) ([]byte, error) {
+	maxBytes := c.config.MaxValueBytes
+	if maxBytes <= 0 {
+		data, err := c.client.Get(ctx, c.key).Bytes()
+		if errors.Is(err, redis.Nil) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to get cache: %w", err)
+		}
+		return data, nil
+	}
+
+	reply, err := boundedGetScript.Run(ctx, c.client, []string{c.key}, maxBytes).Slice()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cache: %w", err)
+	}
+	if len(reply) != 2 {
+		return nil, fmt.Errorf("failed to get cache: unexpected reply of %d elements", len(reply))
+	}
+
+	status, _ := reply[0].(string)
+	payload, _ := reply[1].(string)
+
+	switch status {
+	case "missing":
+		return nil, nil
+	case "toolarge":
+		return nil, fmt.Errorf("cache value size %s exceeds max allowed %d", payload, maxBytes)
+	case "ok":
+		return []byte(payload), nil
+	default:
+		return nil, fmt.Errorf("failed to get cache: unexpected status %q", status)
+	}
 }

@@ -4,9 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 )
 
 // Config holds configuration for the cache.
@@ -16,11 +20,44 @@ type Config[V any] struct {
 	PrimaryKeyFunc KeyFunc[V]
 
 	// HashFunc computes a hash for the cache contents.
-	// If nil, defaultHashFunc is used, which serializes each value with fmt.Sprintf("%v", v).
-	// Warning: the default is not suitable for types containing sensitive fields (passwords, tokens),
-	// as those would be included in the hash input. It may also be non-deterministic for types
-	// with maps or pointer fields. Use WithHashFunc to supply a custom hash (e.g. only stable,
-	// non-sensitive fields in a deterministic order).
+	//
+	// If nil, defaultHashFunc is used. It walks values with reflection and
+	// covers every EXPORTED field regardless of json tags or a custom
+	// MarshalJSON, so state hidden from the wire format still participates in
+	// change detection. Types whose identity lives in unexported fields,
+	// channels or funcs need a HashFunc of their own.
+	//
+	// Warning: the default is not suitable for types containing sensitive
+	// fields (passwords, tokens), as those would be included in the hash
+	// input. Types JSON cannot represent -- channels, funcs, cycles, or types
+	// whose identity lives in unexported fields -- need a custom HashFunc.
+	// Use WithHashFunc to supply one (e.g. only stable, non-sensitive fields
+	// in a deterministic order).
+	//
+	// One limit is worth stating exactly, because it is a property of content
+	// hashing rather than of this implementation: a map keyed by POINTERS
+	// (or channels, or interfaces holding either) is compared by Go using the
+	// keys' IDENTITY, while the hash can only see what they point AT. Given
+	// two distinct *int both addressing 1,
+	//
+	//	map[*int]string{a: "x", b: "y"}
+	//	map[*int]string{a: "y", b: "x"}
+	//
+	// differ observably -- m[a] is "x" in one and "y" in the other -- yet no
+	// function of content alone can tell them apart, since the two keys ARE
+	// the same content. Hashing the addresses instead would distinguish them
+	// but make the digest differ between runs of the same program, which is
+	// the one thing this hash must never do. A type that relies on pointer
+	// identity in map keys needs a HashFunc of its own.
+	//
+	// time.Time KEYS are the same case, less obviously: its == compares the
+	// *Location POINTER and the monotonic reading, not just the instant. So
+	// t.UTC() and t.In(time.FixedZone("z", 0)) are two distinct keys that can
+	// coexist in one map, and even two separately-built FixedZone("z", 0)
+	// values -- identical in name and offset, so indistinguishable by content
+	// -- compare unequal. Both a location pointer and a monotonic reading are
+	// process-local, so a reproducible hash cannot follow them either. Maps
+	// keyed by time.Time, at any depth, need a HashFunc of their own.
 	HashFunc HashFunc[V]
 
 	// ValidateFunc validates a value before storing.
@@ -34,6 +71,13 @@ type Config[V any] struct {
 	// SortFunc is used for deterministic hash calculation.
 	// If nil, values are hashed in insertion order.
 	SortFunc func(values []V) []V
+
+	// OnIndexConflict, if set, is called when two values map to the same
+	// normalized index key. The later value wins and the earlier one becomes
+	// unreachable through that index, which is otherwise entirely silent --
+	// a lookup by email can return a different record than the one intended
+	// when two entries differ only in case or surrounding whitespace.
+	OnIndexConflict func(indexName, key, existingPrimaryKey, newPrimaryKey string)
 }
 
 // DefaultConfig returns a default configuration.
@@ -76,16 +120,408 @@ func (c *Config[V]) WithSortFunc(fn func(values []V) []V) *Config[V] {
 
 // defaultHashFunc provides a simple hash implementation using fmt.Sprintf("%v", v) per value.
 // See Config.HashFunc documentation for sensitivity and determinism caveats.
+// emptyHash is the hash of a cache holding no values. Clear and Set(nil) must
+// produce the same value for change detection to be meaningful.
+func emptyHash() string { return sha256Hash("empty") }
+
+// defaultHashFunc computes a content hash over the cached values.
+//
+// It walks each value with reflection rather than using fmt's %v or
+// json.Marshal.
+//
+// %v prints a POINTER as its address, so a MemoryCache[*User] hashed its
+// memory layout instead of its contents: every process restart, and every
+// reallocation, produced a different hash and change detection reported a
+// change that had not happened. time.Time carries a monotonic reading under
+// %v with the same effect.
+//
+// json.Marshal fixed that but introduced a quieter problem: it honours
+// `json:"-"` and custom MarshalJSON, so state deliberately kept out of the
+// wire format was also kept out of the HASH. Two values differing only in an
+// exported `Password string `json:"-"“ field are observably different
+// through Get and GetAll yet hash identically, so a real change goes
+// undetected -- which is worse than a spurious one. The encoding below
+// includes every exported field whatever its tags say.
+//
+// Each field and element is length-prefixed, so no combination of values can
+// produce the same byte string as a different combination.
+//
+// Values whose identity lives in unexported fields, channels or funcs still
+// need a custom HashFunc; they contribute only their type here.
 func defaultHashFunc[V any](values []V) string {
 	if len(values) == 0 {
-		return sha256Hash("empty")
+		return emptyHash()
 	}
 
 	var sb strings.Builder
 	for _, v := range values {
-		fmt.Fprintf(&sb, "%v\n", v)
+		rv := addressableCopy(reflect.ValueOf(v))
+		// The CONCRETE type, stamped here because reflect.ValueOf unwraps an
+		// interface: when V is `any`, int(1) and int64(1) arrive as plain Int
+		// and Int64 kinds whose encodings are otherwise identical.
+		writeTypeTag(&sb, rv)
+		encodeForHash(&sb, rv)
+		sb.WriteByte(0x1e) // record separator
 	}
 	return sha256Hash(sb.String())
+}
+
+// timeType is compared against so time.Time hashes by instant rather than by
+// its internal representation, which carries a monotonic reading.
+var timeType = reflect.TypeOf(time.Time{})
+
+// addressableCopy returns an addressable copy of v.
+//
+// Addressability is what lets readableValue recover a value the encoder
+// reached through an unexported embedded field. reflect.ValueOf is never
+// addressable, so the copy is made once, at the root, and every field reached
+// from it inherits the property.
+func addressableCopy(v reflect.Value) reflect.Value {
+	if !v.IsValid() {
+		return v
+	}
+	copied := reflect.New(v.Type()).Elem()
+	copied.Set(v)
+	return copied
+}
+
+// addressable returns an addressable equivalent of v when one can be made.
+//
+// An addressable copy at the ROOT is not enough. Addressability propagates
+// through struct fields, pointer dereferences and slice elements, but two
+// containers break the chain: the dynamic value behind an interface and a map
+// value are never addressable. Descending into either left readableValue with
+// nothing to work with, so an unexported embedded time.Time reached through an
+// `any` field or a map value encoded as the constant "t?;" and two different
+// instants hashed alike.
+//
+// Copying requires reading, so a value that is already read-only AND
+// unaddressable is returned unchanged; the encoder's own guard handles it.
+func addressable(v reflect.Value) reflect.Value {
+	if !v.IsValid() || v.CanAddr() || !v.CanInterface() {
+		return v
+	}
+	return addressableCopy(v)
+}
+
+// readableValue returns a value equivalent to v that Interface() accepts.
+//
+// A value reached through an unexported EMBEDDED field carries reflect's
+// read-only flag, and Interface() panics on it -- so
+//
+//	type hiddenTime = time.Time
+//	type Outer struct { hiddenTime }
+//
+// panicked inside Set, even though time.Time's methods are promoted and
+// Outer's instant is ordinary public state. Reading it back through its own
+// address is the standard way to drop the flag, and it is sound here because
+// the value is only ever READ. (A promoted exported FIELD needs none of this:
+// reflect already clears the flag for those.)
+func readableValue(v reflect.Value) reflect.Value {
+	if v.CanInterface() || !v.CanAddr() {
+		return v
+	}
+	return reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem()
+}
+
+// writeTypeTag records v's concrete type.
+//
+// It is written wherever the type would otherwise be invisible to the
+// encoding: at the top level and behind an interface, where the static type
+// says nothing, and for structs, whose field-by-field encoding two unrelated
+// types can share exactly. Elsewhere the static type is fixed by the
+// surrounding struct field, slice or map, so the tag would only cost bytes.
+func writeTypeTag(sb *strings.Builder, v reflect.Value) {
+	if !v.IsValid() {
+		sb.WriteString("<nil>")
+		return
+	}
+	name := typeName(v.Type())
+	fmt.Fprintf(sb, "<%d:%s>", len(name), name)
+}
+
+// typeName identifies a type unambiguously.
+//
+// reflect.Type.String() shortens a named type to "pkg.Name" and is explicitly
+// documented as NOT unique: two dependencies declaring the same type name
+// under the same package name -- different import paths, identical spelling --
+// render alike, so if their exported shapes also match, swapping one value for
+// the other left the hash unchanged. The import PATH disambiguates them.
+func typeName(t reflect.Type) string {
+	if name := t.Name(); name != "" {
+		if pkg := t.PkgPath(); pkg != "" {
+			return pkg + "." + name
+		}
+		return name
+	}
+
+	// Unnamed COMPOUND types are spelled out from their components, each
+	// qualified by this same function. reflect.Type.String() shortens package
+	// names inside them too, so with two dependencies named "foo" at
+	// different import paths each declaring `type ID int`, the distinct types
+	// struct{ X foo1.ID } and struct{ X foo2.ID } both rendered
+	// "struct { X foo.ID }" -- and since the field is encoded as its integer
+	// value, equal values then hashed alike.
+	switch t.Kind() {
+	case reflect.Pointer:
+		return "*" + typeName(t.Elem())
+	case reflect.Slice:
+		return "[]" + typeName(t.Elem())
+	case reflect.Array:
+		return "[" + strconv.Itoa(t.Len()) + "]" + typeName(t.Elem())
+	case reflect.Map:
+		return "map[" + typeName(t.Key()) + "]" + typeName(t.Elem())
+	case reflect.Chan:
+		return t.ChanDir().String() + " " + typeName(t.Elem())
+	case reflect.Func:
+		return funcTypeName(t)
+	case reflect.Struct:
+		return structTypeName(t)
+	case reflect.Interface:
+		return interfaceTypeName(t)
+	default:
+		// Every remaining unnamed kind is a predeclared type, whose String()
+		// is already unambiguous.
+		return t.String()
+	}
+}
+
+func funcTypeName(t reflect.Type) string {
+	var sb strings.Builder
+	sb.WriteString("func(")
+	for i := 0; i < t.NumIn(); i++ {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		if t.IsVariadic() && i == t.NumIn()-1 {
+			sb.WriteString("..." + typeName(t.In(i).Elem()))
+			continue
+		}
+		sb.WriteString(typeName(t.In(i)))
+	}
+	sb.WriteString(")(")
+	for i := 0; i < t.NumOut(); i++ {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(typeName(t.Out(i)))
+	}
+	sb.WriteString(")")
+	return sb.String()
+}
+
+func structTypeName(t reflect.Type) string {
+	var sb strings.Builder
+	sb.WriteString("struct{")
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if i > 0 {
+			sb.WriteString("; ")
+		}
+		if f.Anonymous {
+			sb.WriteString("=")
+		}
+		// The declaring package is part of an unexported field's identity:
+		// two packages can each declare `struct{ id int }` and the types are
+		// not the same.
+		if f.PkgPath != "" {
+			sb.WriteString(f.PkgPath + ".")
+		}
+		fmt.Fprintf(&sb, "%s %s", f.Name, typeName(f.Type))
+		if f.Tag != "" {
+			fmt.Fprintf(&sb, " %q", string(f.Tag))
+		}
+	}
+	sb.WriteString("}")
+	return sb.String()
+}
+
+func interfaceTypeName(t reflect.Type) string {
+	var sb strings.Builder
+	sb.WriteString("interface{")
+	// reflect reports interface methods in sorted order, so this is stable.
+	for i := 0; i < t.NumMethod(); i++ {
+		m := t.Method(i)
+		if i > 0 {
+			sb.WriteString("; ")
+		}
+		if m.PkgPath != "" {
+			sb.WriteString(m.PkgPath + ".")
+		}
+		sb.WriteString(m.Name + strings.TrimPrefix(typeName(m.Type), "func"))
+	}
+	sb.WriteString("}")
+	return sb.String()
+}
+
+// promotesFields reports whether an anonymous field of type t promotes its
+// own fields to the embedding struct: a struct, or a pointer to one.
+func promotesFields(t reflect.Type) bool {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return t.Kind() == reflect.Struct
+}
+
+// encodeForHash writes a deterministic, length-prefixed encoding of v.
+func encodeForHash(sb *strings.Builder, v reflect.Value) {
+	if !v.IsValid() {
+		sb.WriteString("nil;")
+		return
+	}
+
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		// Follow the pointer: its ADDRESS is not content.
+		if v.IsNil() {
+			sb.WriteString("nil;")
+			return
+		}
+		if v.Kind() == reflect.Interface {
+			// What the interface HOLDS is content. Following it blind made
+			// any(int(1)) and any(int64(1)) -- and any two struct types with
+			// the same exported shape -- encode identically, so swapping one
+			// for the other left GetHash() unchanged.
+			writeTypeTag(sb, v.Elem())
+		}
+		// addressable: an interface's dynamic value is never addressable, and
+		// a pointer's target always is, so this only costs a copy on the
+		// interface path -- where it is what keeps an embedded instant
+		// readable further down.
+		encodeForHash(sb, addressable(v.Elem()))
+
+	case reflect.Struct:
+		if v.Type() == timeType {
+			// Wall clock only, and in UTC: the monotonic reading and the
+			// location pointer are not content.
+			// Seconds plus nanoseconds, never UnixNano: that is undefined
+			// outside 1678..2262, and it wraps modulo 2^64, so two instants
+			// 584.9 years apart encoded identically and the same instant
+			// could encode differently on another implementation. Unix() is
+			// valid across the whole range.
+			rv := readableValue(v)
+			if !rv.CanInterface() {
+				// Unreachable with an addressable root, but a cache key must
+				// never panic: encode the type and give up on the instant.
+				sb.WriteString("t?;")
+				return
+			}
+			t := rv.Interface().(time.Time)
+			fmt.Fprintf(sb, "t%d.%09d;", t.UTC().Unix(), t.Nanosecond())
+			return
+		}
+		t := v.Type()
+		writeTypeTag(sb, v)
+		sb.WriteString("{")
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath != "" {
+				// Unexported, so not part of the API -- EXCEPT an anonymous
+				// one, whose own exported fields are promoted and are. A
+				// public type embedding an unexported struct exposes v.ID to
+				// every caller, and skipping the whole embed meant a value
+				// differing only there hashed the same.
+				//
+				// A POINTER to a struct promotes its fields too, so
+				// `struct{ *inner }` reads v.ID exactly as `struct{ inner }`
+				// does; testing only for Kind() == Struct skipped it.
+				if !f.Anonymous || !promotesFields(f.Type) {
+					continue
+				}
+				fmt.Fprintf(sb, "%d:%s=", len(f.Name), f.Name)
+				encodeForHash(sb, v.Field(i))
+				continue
+			}
+			// The field NAME is included so renaming or reordering fields
+			// cannot collide, and no json tag is consulted.
+			fmt.Fprintf(sb, "%d:%s=", len(f.Name), f.Name)
+			encodeForHash(sb, v.Field(i))
+		}
+		sb.WriteString("}")
+
+	case reflect.Slice, reflect.Array:
+		if v.Kind() == reflect.Slice && v.IsNil() {
+			sb.WriteString("nil;")
+			return
+		}
+		fmt.Fprintf(sb, "[%d", v.Len())
+		for i := 0; i < v.Len(); i++ {
+			sb.WriteByte(',')
+			encodeForHash(sb, v.Index(i))
+		}
+		sb.WriteString("]")
+
+	case reflect.Map:
+		if v.IsNil() {
+			sb.WriteString("nil;")
+			return
+		}
+		// Map iteration order is randomized, so the keys are sorted by their
+		// own encoding to keep the digest stable.
+		//
+		// Keys are encoded by CONTENT, which is what makes the digest
+		// reproducible across runs and what makes a pointer-keyed map
+		// imperfectly represented here -- see Config.HashFunc.
+		//
+		// MapRange, not MapKeys plus MapIndex: a NaN float or complex key is
+		// returned by MapKeys but is not equal to itself, so MapIndex(key)
+		// comes back invalid and its value was encoded as "nil;" -- changing
+		// that value alone left GetHash() unchanged. The iterator keeps each
+		// value paired with its key.
+		entries := make([]string, 0, v.Len())
+		for iter := v.MapRange(); iter.Next(); {
+			var entry strings.Builder
+			// Map keys and values are never addressable either.
+			encodeForHash(&entry, addressable(iter.Key()))
+			entry.WriteByte('=')
+			encodeForHash(&entry, addressable(iter.Value()))
+			entries = append(entries, entry.String())
+		}
+		sort.Strings(entries)
+		fmt.Fprintf(sb, "m%d", len(entries))
+		for _, e := range entries {
+			fmt.Fprintf(sb, ",%d:%s", len(e), e)
+		}
+
+	case reflect.String:
+		fmt.Fprintf(sb, "%d:%s;", len(v.String()), v.String())
+
+	case reflect.Bool:
+		fmt.Fprintf(sb, "b%t;", v.Bool())
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		fmt.Fprintf(sb, "i%d;", v.Int())
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		fmt.Fprintf(sb, "u%d;", v.Uint())
+
+	case reflect.Float32:
+		// At its OWN width: widening a float32 NaN to float64 is not
+		// guaranteed to carry the payload bits through.
+		fmt.Fprintf(sb, "f%08x;", math.Float32bits(float32(v.Float())))
+
+	case reflect.Float64:
+		// The IEEE bits, not %v. Every NaN renders as the same "NaN" token,
+		// while the value handed back by Get keeps its sign and payload bits
+		// -- so a caller reading math.Float64bits saw a change the hash did
+		// not. The bits also separate +0 from -0, which %v does not.
+		fmt.Fprintf(sb, "f%016x;", math.Float64bits(v.Float()))
+
+	case reflect.Complex64:
+		c := v.Complex()
+		fmt.Fprintf(sb, "c%08x,%08x;",
+			math.Float32bits(float32(real(c))), math.Float32bits(float32(imag(c))))
+
+	case reflect.Complex128:
+		c := v.Complex()
+		fmt.Fprintf(sb, "c%016x,%016x;", math.Float64bits(real(c)), math.Float64bits(imag(c)))
+
+	default:
+		// Channels, funcs and anything else with no content to speak of.
+		// Only the TYPE contributes, so such a cache needs a custom HashFunc
+		// to detect changes.
+		fmt.Fprintf(sb, "?%s;", v.Type().String())
+	}
 }
 
 // sha256Hash computes SHA256 hash of a string.
@@ -113,7 +549,12 @@ type RedisConfig struct {
 	OperationTimeout time.Duration
 
 	// MaxValueBytes limits the size of the value read from Redis in Get(). If <= 0, no limit is applied.
-	// Default: 16MB. Prevents OOM from malicious or corrupted oversized values in Redis.
+	// Default: 16MB.
+	//
+	// The size is checked with STRLEN before the value is fetched, so an
+	// oversized value is never pulled into memory. Checking len(data) after
+	// GET, as this used to, only prevented the unmarshal -- the allocation the
+	// limit exists to avoid had already happened.
 	MaxValueBytes int
 }
 

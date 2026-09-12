@@ -27,32 +27,59 @@ func NewMultiIndexCache[V any](config *Config[V]) *MemoryCache[V] {
 	if config == nil {
 		config = DefaultConfig[V]()
 	}
-	return &MemoryCache[V]{
+	c := &MemoryCache[V]{
 		config:   config,
 		data:     make(map[string]V),
 		order:    make([]string, 0),
 		indexes:  make(map[string]map[string]string),
 		indexFns: make(map[string]KeyFunc[V]),
 	}
+	// Start at the empty-state hash, the same value Clear() computes. Leaving
+	// it "" meant calling Clear on an already-empty new cache CHANGED
+	// GetHash(), reporting the phantom change this hashing is meant to rule
+	// out.
+	c.hash = c.calculateHash()
+	return c
 }
 
 // AddIndex registers a new index with a key extraction function.
 // The keyFunc extracts the index key from a value.
 // If an index with the same name exists, it will be replaced.
 func (c *MemoryCache[V]) AddIndex(name string, keyFunc KeyFunc[V]) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	conflicts := func() []indexConflict {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	c.indexFns[name] = keyFunc
-	c.indexes[name] = make(map[string]string)
+		c.indexFns[name] = keyFunc
+		c.indexes[name] = make(map[string]string)
 
-	// Rebuild index for existing data
-	for pk, v := range c.data {
-		indexKey := keyFunc(v)
-		if indexKey != "" {
-			c.indexes[name][c.normalizeKey(indexKey)] = pk
+		// Rebuild the index over data already in the cache.
+		//
+		// Collisions here used to pass silently, unlike the ones Set reports,
+		// even though populating the cache before calling AddIndex is a
+		// supported order. Ranging over a map also makes the surviving primary
+		// key nondeterministic, so the winner is chosen by insertion order
+		// instead and every loser is reported.
+		var found []indexConflict
+		for _, pk := range c.order {
+			v, ok := c.data[pk]
+			if !ok {
+				continue
+			}
+			indexKey := keyFunc(v)
+			if indexKey == "" {
+				continue
+			}
+			normalized := c.normalizeKey(indexKey)
+			if existing, clash := c.indexes[name][normalized]; clash && existing != pk {
+				found = append(found, indexConflict{index: name, key: normalized, existing: existing, replacement: pk})
+			}
+			c.indexes[name][normalized] = pk
 		}
-	}
+		return found
+	}()
+
+	c.reportIndexConflicts(conflicts)
 }
 
 // RemoveIndex removes an index by name.
@@ -108,12 +135,20 @@ func (c *MemoryCache[V]) Get(key string) (V, bool) {
 // Duplicate primary keys will be updated (last one wins).
 // Panics if PrimaryKeyFunc is nil and len(values) > 0; set PrimaryKeyFunc via config before use with non-empty data.
 func (c *MemoryCache[V]) Set(values []V) {
-	if len(values) > 0 && c.config.PrimaryKeyFunc == nil {
-		panic("cache-kit: MultiIndexCache requires PrimaryKeyFunc when setting non-empty data; set it via config.WithPrimaryKey()")
-	}
+	c.reportIndexConflicts(c.setLocked(values))
+}
+
+// setLocked is Set's mutating half. It returns the index conflicts it found
+// rather than dispatching them, so the callbacks run with the lock released.
+func (c *MemoryCache[V]) setLocked(values []V) []indexConflict {
+	var conflicts []indexConflict
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if len(values) > 0 && c.config.PrimaryKeyFunc == nil {
+		panic("cache-kit: MultiIndexCache requires PrimaryKeyFunc when setting non-empty data; set it via config.WithPrimaryKey()")
+	}
 
 	// Clear existing data
 	c.data = make(map[string]V, len(values))
@@ -158,14 +193,52 @@ func (c *MemoryCache[V]) Set(values []V) {
 		// Update all indexes
 		for name, keyFunc := range c.indexFns {
 			indexKey := keyFunc(v)
-			if indexKey != "" {
-				c.indexes[name][c.normalizeKey(indexKey)] = pk
+			if indexKey == "" {
+				continue
 			}
+			normalized := c.normalizeKey(indexKey)
+			// Index keys are normalized (lower-cased, trimmed), so two values
+			// differing only in case collide here and the later one silently
+			// shadows the earlier -- a lookup by email could return a
+			// different user than the one asked for. Report it rather than
+			// letting it pass unnoticed.
+			if existing, clash := c.indexes[name][normalized]; clash && existing != pk {
+				// Collected, not called: this is caller code, and a handler
+				// reaching back into Get, Len or GetAll would block forever on
+				// this same non-reentrant mutex.
+				conflicts = append(conflicts, indexConflict{index: name, key: normalized, existing: existing, replacement: pk})
+			}
+			c.indexes[name][normalized] = pk
 		}
 	}
 
 	// Calculate and cache hash
 	c.hash = c.calculateHash()
+
+	return conflicts
+}
+
+// indexConflict records two values mapping to one normalized index key.
+type indexConflict struct {
+	index       string
+	key         string
+	existing    string
+	replacement string
+}
+
+// reportIndexConflicts invokes OnIndexConflict for each conflict.
+//
+// It must be called with c.mu released: the handler is caller code, and one
+// that inspects the cache through Get, Len, GetAll or another locking method
+// would block forever on this non-reentrant mutex -- the same callback
+// re-entry problem Iterate was changed to avoid.
+func (c *MemoryCache[V]) reportIndexConflicts(conflicts []indexConflict) {
+	if len(conflicts) == 0 || c.config.OnIndexConflict == nil {
+		return
+	}
+	for _, conflict := range conflicts {
+		c.config.OnIndexConflict(conflict.index, conflict.key, conflict.existing, conflict.replacement)
+	}
 }
 
 // GetAll returns all cached values in insertion order.
@@ -200,7 +273,10 @@ func (c *MemoryCache[V]) Clear() {
 	for name := range c.indexes {
 		c.indexes[name] = make(map[string]string)
 	}
-	c.hash = ""
+	// Same state, same hash. Setting this to "" made Clear() and Set(nil)
+	// report two different hashes for an equally empty cache, so change
+	// detection saw a change that had not happened.
+	c.hash = c.calculateHash()
 }
 
 // GetHash returns a hash representing the current cache state.
@@ -213,16 +289,18 @@ func (c *MemoryCache[V]) GetHash() string {
 
 // Iterate applies a function to each cached value in insertion order.
 // If the function returns false, iteration stops.
-// The callback must not panic; if it does, the read lock may block other goroutines until recovery.
+//
+// The values are snapshotted under the read lock and the callback runs
+// without it held. Calling it under the lock deadlocked any callback that
+// touched the cache again -- Go's RWMutex is not reentrant, and a waiting
+// writer blocks further RLock attempts -- and a panicking callback left the
+// lock held. The trade-off is that the callback sees a snapshot rather than
+// live data, which is the same guarantee GetAll already gives.
 func (c *MemoryCache[V]) Iterate(fn func(value V) bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	for _, pk := range c.order {
-		if v, exists := c.data[pk]; exists {
-			if !fn(v) {
-				return
-			}
+	snapshot := c.GetAll()
+	for _, v := range snapshot {
+		if !fn(v) {
+			return
 		}
 	}
 }
@@ -255,6 +333,11 @@ func (c *MemoryCache[V]) calculateHash() string {
 }
 
 // normalizeKey normalizes an index key (lowercase, trimmed).
+//
+// Note that primary keys are NOT normalized: Get("ABC") and
+// GetByIndex(name, "ABC") therefore behave differently for the same string.
+// That asymmetry is longstanding and load-bearing for existing callers, so it
+// is documented rather than changed.
 func (c *MemoryCache[V]) normalizeKey(key string) string {
 	return strings.ToLower(strings.TrimSpace(key))
 }

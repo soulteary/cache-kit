@@ -232,10 +232,16 @@ func TestMemoryCache_Hash(t *testing.T) {
 
 	cache := NewMultiIndexCache(config)
 
-	// Empty cache hash
+	// An empty cache has the empty-STATE hash, not an empty string: Clear()
+	// computes the same value, so a new cache reporting "" made Clear() on an
+	// already-empty cache look like a change.
 	hash1 := cache.GetHash()
-	if hash1 != "" {
-		t.Error("Expected empty hash for empty cache")
+	if hash1 != emptyHash() {
+		t.Errorf("new cache hash = %q, want the empty-state hash %q", hash1, emptyHash())
+	}
+	cache.Clear()
+	if got := cache.GetHash(); got != hash1 {
+		t.Errorf("Clear() on an empty cache changed the hash: %q -> %q", hash1, got)
 	}
 
 	// Set data
