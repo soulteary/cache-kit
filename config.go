@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -154,8 +155,25 @@ func writeTypeTag(sb *strings.Builder, v reflect.Value) {
 		sb.WriteString("<nil>")
 		return
 	}
-	name := v.Type().String()
+	name := typeName(v.Type())
 	fmt.Fprintf(sb, "<%d:%s>", len(name), name)
+}
+
+// typeName identifies a type unambiguously.
+//
+// reflect.Type.String() shortens a named type to "pkg.Name" and is explicitly
+// documented as NOT unique: two dependencies declaring the same type name
+// under the same package name -- different import paths, identical spelling --
+// render alike, so if their exported shapes also match, swapping one value for
+// the other left the hash unchanged. The import PATH disambiguates them.
+func typeName(t reflect.Type) string {
+	if name := t.Name(); name != "" {
+		if pkg := t.PkgPath(); pkg != "" {
+			return pkg + "." + name
+		}
+		return name
+	}
+	return t.String()
 }
 
 // encodeForHash writes a deterministic, length-prefixed encoding of v.
@@ -200,7 +218,17 @@ func encodeForHash(sb *strings.Builder, v reflect.Value) {
 		for i := 0; i < t.NumField(); i++ {
 			f := t.Field(i)
 			if f.PkgPath != "" {
-				continue // unexported: not readable, and not part of the API
+				// Unexported, so not part of the API -- EXCEPT an anonymous
+				// one, whose own exported fields are promoted and are. A
+				// public type embedding an unexported struct exposes v.ID to
+				// every caller, and skipping the whole embed meant a value
+				// differing only there hashed the same.
+				if !f.Anonymous || f.Type.Kind() != reflect.Struct {
+					continue
+				}
+				fmt.Fprintf(sb, "%d:%s=", len(f.Name), f.Name)
+				encodeForHash(sb, v.Field(i))
+				continue
 			}
 			// The field NAME is included so renaming or reordering fields
 			// cannot collide, and no json tag is consulted.
@@ -260,11 +288,26 @@ func encodeForHash(sb *strings.Builder, v reflect.Value) {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		fmt.Fprintf(sb, "u%d;", v.Uint())
 
-	case reflect.Float32, reflect.Float64:
-		fmt.Fprintf(sb, "f%v;", v.Float())
+	case reflect.Float32:
+		// At its OWN width: widening a float32 NaN to float64 is not
+		// guaranteed to carry the payload bits through.
+		fmt.Fprintf(sb, "f%08x;", math.Float32bits(float32(v.Float())))
 
-	case reflect.Complex64, reflect.Complex128:
-		fmt.Fprintf(sb, "c%v;", v.Complex())
+	case reflect.Float64:
+		// The IEEE bits, not %v. Every NaN renders as the same "NaN" token,
+		// while the value handed back by Get keeps its sign and payload bits
+		// -- so a caller reading math.Float64bits saw a change the hash did
+		// not. The bits also separate +0 from -0, which %v does not.
+		fmt.Fprintf(sb, "f%016x;", math.Float64bits(v.Float()))
+
+	case reflect.Complex64:
+		c := v.Complex()
+		fmt.Fprintf(sb, "c%08x,%08x;",
+			math.Float32bits(float32(real(c))), math.Float32bits(float32(imag(c))))
+
+	case reflect.Complex128:
+		c := v.Complex()
+		fmt.Fprintf(sb, "c%016x,%016x;", math.Float64bits(real(c)), math.Float64bits(imag(c)))
 
 	default:
 		// Channels, funcs and anything else with no content to speak of.

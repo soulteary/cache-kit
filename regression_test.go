@@ -2,6 +2,7 @@ package cache
 
 import (
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -462,5 +463,94 @@ func TestHashCoversValuesUnderNaNMapKeys(t *testing.T) {
 
 	if defaultHashFunc([]holder{a}) == defaultHashFunc([]holder{b}) {
 		t.Error("changing the value stored under a NaN key did not change the hash")
+	}
+}
+
+// --- Codex review round 4 (PR #3) ---
+
+// promotedID is an unexported struct embedded below. Its exported field is
+// promoted, so callers read it as x.ID.
+type promotedID struct{ ID string }
+
+type withPromoted struct {
+	promotedID
+	Name string
+}
+
+// TestHashCoversPromotedExportedFields is the regression test for skipping an
+// anonymous UNEXPORTED embed. Its own exported fields are promoted, so a
+// caller reads them off the public type -- but the encoder skipped the whole
+// embedded value, and a change confined to one left GetHash() unchanged.
+func TestHashCoversPromotedExportedFields(t *testing.T) {
+	a := withPromoted{promotedID: promotedID{ID: "1"}, Name: "x"}
+	b := withPromoted{promotedID: promotedID{ID: "2"}, Name: "x"}
+
+	if defaultHashFunc([]withPromoted{a}) == defaultHashFunc([]withPromoted{b}) {
+		t.Error("a change to a promoted exported field did not change the hash")
+	}
+	if a.ID == b.ID {
+		t.Fatal("the fixture does not actually promote ID")
+	}
+}
+
+// TestHashDistinguishesNaNPayloads is the regression test for encoding floats
+// with %v, which renders every NaN as the same token. The value Get hands back
+// keeps its sign and payload bits, so a caller reading math.Float64bits could
+// see a change the hash did not.
+func TestHashDistinguishesNaNPayloads(t *testing.T) {
+	type holder struct {
+		F   float64
+		F32 float32
+		C   complex128
+	}
+
+	quiet := math.Float64frombits(0x7FF8000000000001)
+	other := math.Float64frombits(0x7FF8000000000002)
+	if !math.IsNaN(quiet) || !math.IsNaN(other) {
+		t.Fatal("the fixture values are not NaN")
+	}
+
+	if defaultHashFunc([]holder{{F: quiet}}) == defaultHashFunc([]holder{{F: other}}) {
+		t.Error("two distinct NaN payloads hashed the same")
+	}
+
+	// Signed zero is a real difference too, and %v hides it.
+	if defaultHashFunc([]holder{{F: 0}}) == defaultHashFunc([]holder{{F: math.Copysign(0, -1)}}) {
+		t.Error("+0 and -0 hashed the same")
+	}
+
+	// float32 at its own width.
+	f32a := math.Float32frombits(0x7FC00001)
+	f32b := math.Float32frombits(0x7FC00002)
+	if defaultHashFunc([]holder{{F32: f32a}}) == defaultHashFunc([]holder{{F32: f32b}}) {
+		t.Error("two distinct float32 NaN payloads hashed the same")
+	}
+
+	// And each complex component.
+	if defaultHashFunc([]holder{{C: complex(quiet, 1)}}) == defaultHashFunc([]holder{{C: complex(other, 1)}}) {
+		t.Error("distinct NaN payloads in a complex real part hashed the same")
+	}
+}
+
+// TestTypeTagsUseTheImportPath is the regression test for identifying types
+// with reflect.Type.String(), which shortens a named type to "pkg.Name" and is
+// documented as not unique: two dependencies declaring the same name under the
+// same package name render alike.
+func TestTypeTagsUseTheImportPath(t *testing.T) {
+	// Through writeTypeTag, so this covers the encoder's call site and not
+	// just the helper.
+	var sb strings.Builder
+	writeTypeTag(&sb, reflect.ValueOf(withPromoted{}))
+	tag := sb.String()
+	if !strings.Contains(tag, "soulteary/cache-kit") {
+		t.Errorf("type tag = %q, want it to carry the import path", tag)
+	}
+	if strings.Contains(tag, reflect.TypeOf(withPromoted{}).String()+">") {
+		t.Errorf("type tag = %q is String()'s shortened spelling; the path is not being used", tag)
+	}
+
+	// Unnamed types have no path and fall back to the structural spelling.
+	if got := typeName(reflect.TypeOf([]int{})); got != "[]int" {
+		t.Errorf("typeName([]int) = %q, want []int", got)
 	}
 }
