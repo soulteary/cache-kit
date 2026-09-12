@@ -33,6 +33,22 @@ type Config[V any] struct {
 	// whose identity lives in unexported fields -- need a custom HashFunc.
 	// Use WithHashFunc to supply one (e.g. only stable, non-sensitive fields
 	// in a deterministic order).
+	//
+	// One limit is worth stating exactly, because it is a property of content
+	// hashing rather than of this implementation: a map keyed by POINTERS
+	// (or channels, or interfaces holding either) is compared by Go using the
+	// keys' IDENTITY, while the hash can only see what they point AT. Given
+	// two distinct *int both addressing 1,
+	//
+	//	map[*int]string{a: "x", b: "y"}
+	//	map[*int]string{a: "y", b: "x"}
+	//
+	// differ observably -- m[a] is "x" in one and "y" in the other -- yet no
+	// function of content alone can tell them apart, since the two keys ARE
+	// the same content. Hashing the addresses instead would distinguish them
+	// but make the digest differ between runs of the same program, which is
+	// the one thing this hash must never do. A type that relies on pointer
+	// identity in map keys needs a HashFunc of its own.
 	HashFunc HashFunc[V]
 
 	// ValidateFunc validates a value before storing.
@@ -433,6 +449,10 @@ func encodeForHash(sb *strings.Builder, v reflect.Value) {
 		}
 		// Map iteration order is randomized, so the keys are sorted by their
 		// own encoding to keep the digest stable.
+		//
+		// Keys are encoded by CONTENT, which is what makes the digest
+		// reproducible across runs and what makes a pointer-keyed map
+		// imperfectly represented here -- see Config.HashFunc.
 		//
 		// MapRange, not MapKeys plus MapIndex: a NaN float or complex key is
 		// returned by MapKeys but is not equal to itself, so MapIndex(key)

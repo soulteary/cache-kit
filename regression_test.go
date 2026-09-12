@@ -742,3 +742,43 @@ func TestNestedInterfaceKeepsEmbeddedTime(t *testing.T) {
 		t.Error("an embedded instant behind map -> interface -> slice -> interface hashed the same")
 	}
 }
+
+// TestPointerKeyedMapsAreNotFullyDistinguished pins a LIMIT, not a bug.
+//
+// Go compares map keys by identity, so two distinct *int both addressing 1 are
+// different keys; a content hash sees only what they point at, so the two maps
+// below are indistinguishable to it even though m[a] differs between them.
+// Hashing the addresses would separate them and would also make the digest
+// differ between runs of the same program, which is the one property this hash
+// cannot give up.
+//
+// The test exists so that a future change which appears to "fix" this is
+// recognised for what it would cost. A type relying on pointer identity in map
+// keys needs its own HashFunc, as Config.HashFunc documents.
+func TestPointerKeyedMapsAreNotFullyDistinguished(t *testing.T) {
+	one, uno := 1, 1
+	a, b := &one, &uno
+
+	swapped := defaultHashFunc([]any{map[*int]string{a: "x", b: "y"}}) ==
+		defaultHashFunc([]any{map[*int]string{a: "y", b: "x"}})
+	if !swapped {
+		t.Error("pointer-keyed maps with equal pointees are now distinguished -- " +
+			"confirm the digest is still identical across separate runs of the same binary")
+	}
+
+	// What the hash CAN do, and must keep doing: distinguish them whenever the
+	// keys differ in content.
+	two := 2
+	c := &two
+	if defaultHashFunc([]any{map[*int]string{a: "x", c: "y"}}) ==
+		defaultHashFunc([]any{map[*int]string{a: "y", c: "x"}}) {
+		t.Error("pointer keys with DIFFERENT pointees were not distinguished")
+	}
+
+	// And the digest is stable for the same content, which is the property
+	// being protected.
+	if defaultHashFunc([]any{map[*int]string{a: "x"}}) !=
+		defaultHashFunc([]any{map[*int]string{b: "x"}}) {
+		t.Error("the same content behind different addresses hashed differently; the digest is not reproducible")
+	}
+}
