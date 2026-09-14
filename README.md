@@ -390,6 +390,13 @@ c.Memory() *cache.MemoryCache[V]
 c.Redis() *cache.RedisCache[V]
 ```
 
+## Upgrade Notes (v1.7.0)
+
+Dependency refresh only. No API was removed and no call needs rewriting.
+
+- Test Redis is `miniredis` v2.39.0 (was v2.36.1).
+- Transitive `yuin/gopher-lua` is v1.1.2 (was v1.1.1), matching the other kits.
+
 ## Upgrade Notes (v1.6.0)
 
 Change detection and the Redis value guard both behave differently in this
