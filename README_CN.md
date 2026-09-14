@@ -374,6 +374,13 @@ c.Memory() *cache.MemoryCache[V]
 c.Redis() *cache.RedisCache[V]
 ```
 
+## 升级说明（v1.7.0）
+
+仅升级依赖。没有删除任何 API，调用方无需改代码。
+
+- 测试用 Redis 为 `miniredis` v2.39.0（此前 v2.36.1）。
+- 间接依赖 `yuin/gopher-lua` 升至 v1.1.2（此前 v1.1.1），与其他 kit 对齐。
+
 ## 升级说明（v1.6.0）
 
 本次发布改变了变更检测与 Redis 值上限守卫的行为。没有删除或改签名的导出函数，新增了
