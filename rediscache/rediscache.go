@@ -12,7 +12,7 @@
 // the Redis-backed cache and [Hybrid], which pairs the two.
 //
 //	c := rediscache.New[User](client, rediscache.DefaultConfig().WithKeyPrefix("users:"))
-//	if err := c.Set(users); err != nil {
+//	if err := c.Set(ctx, users); err != nil {
 //		return err
 //	}
 package rediscache
@@ -61,7 +61,9 @@ type Config struct {
 	// Default: 1 hour
 	TTL time.Duration
 
-	// OperationTimeout is the timeout for Redis operations.
+	// OperationTimeout bounds a single Redis operation, on top of the
+	// deadline the caller's context already carries. Non-positive means no
+	// bound of this package's own.
 	// Default: 5 seconds
 	OperationTimeout time.Duration
 
@@ -214,14 +216,22 @@ func isNil(c Client) bool {
 	}
 }
 
-// getContext creates a context with timeout.
+// operationContext bounds one operation by OperationTimeout, on top of
+// whatever deadline and cancellation the caller already carries.
 //
-// NOTE: this is rooted at context.Background, so a caller's cancellation and
-// trace context do not reach Redis. Every method here takes no context
-// parameter, so fixing that means changing the exported signatures; it is
-// called out rather than changed.
-func (c *Cache[V]) getContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), c.config.OperationTimeout)
+// This used to be rooted at context.Background, so a cancelled request kept
+// its Redis call alive and no trace context ever reached the server. Fixing
+// it meant a context parameter on every exported method, which is why it
+// waited for a major version.
+//
+// A non-positive OperationTimeout means this package adds no bound of its own
+// and the caller's context stands as given. It used to mean an already-expired
+// context -- every operation failing before it was issued.
+func (c *Cache[V]) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.config.OperationTimeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, c.config.OperationTimeout)
 }
 
 // versionKey returns the version key for this cache.
@@ -241,7 +251,7 @@ func (c *Cache[V]) effectiveTTL(ttl time.Duration) time.Duration {
 }
 
 // Set stores values in Redis and increments the version.
-func (c *Cache[V]) Set(values []V) error {
+func (c *Cache[V]) Set(ctx context.Context, values []V) error {
 	if !c.hasClient {
 		return errNilClient
 	}
@@ -251,7 +261,7 @@ func (c *Cache[V]) Set(values []V) error {
 		return fmt.Errorf("failed to marshal values: %w", err)
 	}
 
-	ctx, cancel := c.getContext()
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 
 	ttl := c.effectiveTTL(c.config.TTL)
@@ -280,12 +290,12 @@ func (c *Cache[V]) Set(values []V) error {
 // Get retrieves values from Redis.
 // Returns an empty slice if the key doesn't exist.
 // If the stored value exceeds MaxValueBytes (when set in config), returns an error to prevent OOM.
-func (c *Cache[V]) Get() ([]V, error) {
+func (c *Cache[V]) Get(ctx context.Context) ([]V, error) {
 	if !c.hasClient {
 		return nil, errNilClient
 	}
 
-	ctx, cancel := c.getContext()
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 
 	// Measure and fetch ATOMICALLY. Reading the value and then measuring it
@@ -312,12 +322,12 @@ func (c *Cache[V]) Get() ([]V, error) {
 }
 
 // Exists checks if the cache key exists.
-func (c *Cache[V]) Exists() (bool, error) {
+func (c *Cache[V]) Exists(ctx context.Context) (bool, error) {
 	if !c.hasClient {
 		return false, errNilClient
 	}
 
-	ctx, cancel := c.getContext()
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 
 	count, err := c.client.Exists(ctx, c.key).Result()
@@ -330,12 +340,12 @@ func (c *Cache[V]) Exists() (bool, error) {
 
 // GetVersion returns the current cache version.
 // Returns 0 if the version key doesn't exist.
-func (c *Cache[V]) GetVersion() (int64, error) {
+func (c *Cache[V]) GetVersion(ctx context.Context) (int64, error) {
 	if !c.hasClient {
 		return 0, errNilClient
 	}
 
-	ctx, cancel := c.getContext()
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 
 	version, err := c.client.Get(ctx, c.versionKey()).Int64()
@@ -351,12 +361,12 @@ func (c *Cache[V]) GetVersion() (int64, error) {
 
 // Clear deletes the cache key and the version key.
 // After Clear(), GetVersion() returns 0 (version key is removed).
-func (c *Cache[V]) Clear() error {
+func (c *Cache[V]) Clear(ctx context.Context) error {
 	if !c.hasClient {
 		return errNilClient
 	}
 
-	ctx, cancel := c.getContext()
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 
 	pipe := c.client.TxPipeline()
@@ -367,7 +377,7 @@ func (c *Cache[V]) Clear() error {
 }
 
 // SetWithTTL stores values with a custom TTL.
-func (c *Cache[V]) SetWithTTL(values []V, ttl time.Duration) error {
+func (c *Cache[V]) SetWithTTL(ctx context.Context, values []V, ttl time.Duration) error {
 	if !c.hasClient {
 		return errNilClient
 	}
@@ -377,7 +387,7 @@ func (c *Cache[V]) SetWithTTL(values []V, ttl time.Duration) error {
 		return fmt.Errorf("failed to marshal values: %w", err)
 	}
 
-	ctx, cancel := c.getContext()
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 
 	effectiveTTL := c.effectiveTTL(ttl)
@@ -396,12 +406,12 @@ func (c *Cache[V]) SetWithTTL(values []V, ttl time.Duration) error {
 }
 
 // TTL returns the remaining TTL for the cache key.
-func (c *Cache[V]) TTL() (time.Duration, error) {
+func (c *Cache[V]) TTL(ctx context.Context) (time.Duration, error) {
 	if !c.hasClient {
 		return 0, errNilClient
 	}
 
-	ctx, cancel := c.getContext()
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 
 	ttl, err := c.client.TTL(ctx, c.key).Result()
@@ -413,12 +423,12 @@ func (c *Cache[V]) TTL() (time.Duration, error) {
 }
 
 // Refresh extends the TTL of the cache without changing the data.
-func (c *Cache[V]) Refresh() error {
+func (c *Cache[V]) Refresh(ctx context.Context) error {
 	if !c.hasClient {
 		return errNilClient
 	}
 
-	ctx, cancel := c.getContext()
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 
 	ttl := c.effectiveTTL(c.config.TTL)

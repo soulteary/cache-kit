@@ -7,6 +7,7 @@ import (
 )
 
 func TestHybridCache_BasicOperations(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	memConfig := cache.DefaultConfig[TestUser]().
@@ -23,7 +24,7 @@ func TestHybridCache_BasicOperations(t *testing.T) {
 		{ID: "1", Email: "user1@example.com"},
 		{ID: "2", Email: "user2@example.com"},
 	}
-	if err := hybrid.Set(users); err != nil {
+	if err := hybrid.Set(ctx, users); err != nil {
 		t.Fatalf("Set error: %v", err)
 	}
 
@@ -43,7 +44,7 @@ func TestHybridCache_BasicOperations(t *testing.T) {
 	}
 
 	// Test Redis persistence
-	redisData, err := hybrid.Redis().Get()
+	redisData, err := hybrid.Redis().Get(ctx)
 	if err != nil {
 		t.Fatalf("Redis Get error: %v", err)
 	}
@@ -53,6 +54,7 @@ func TestHybridCache_BasicOperations(t *testing.T) {
 }
 
 func TestHybridCache_LoadFromRedis(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	memConfig := cache.DefaultConfig[TestUser]().
@@ -67,7 +69,7 @@ func TestHybridCache_LoadFromRedis(t *testing.T) {
 	users := []TestUser{
 		{ID: "1", Email: "redis-user@example.com"},
 	}
-	if err := redisCache.Set(users); err != nil {
+	if err := redisCache.Set(ctx, users); err != nil {
 		t.Fatalf("Redis Set error: %v", err)
 	}
 
@@ -77,7 +79,7 @@ func TestHybridCache_LoadFromRedis(t *testing.T) {
 	}
 
 	// Load from Redis
-	if err := hybrid.LoadFromRedis(); err != nil {
+	if err := hybrid.LoadFromRedis(ctx); err != nil {
 		t.Fatalf("LoadFromRedis error: %v", err)
 	}
 
@@ -97,6 +99,7 @@ func TestHybridCache_LoadFromRedis(t *testing.T) {
 }
 
 func TestHybridCache_SyncToRedis(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	memConfig := cache.DefaultConfig[TestUser]().
@@ -111,18 +114,18 @@ func TestHybridCache_SyncToRedis(t *testing.T) {
 	})
 
 	// Redis should be empty
-	exists, _ := hybrid.Redis().Exists()
+	exists, _ := hybrid.Redis().Exists(ctx)
 	if exists {
 		t.Error("Expected Redis to be empty initially")
 	}
 
 	// Sync to Redis
-	if err := hybrid.SyncToRedis(); err != nil {
+	if err := hybrid.SyncToRedis(ctx); err != nil {
 		t.Fatalf("SyncToRedis error: %v", err)
 	}
 
 	// Redis should now have data
-	redisData, err := hybrid.Redis().Get()
+	redisData, err := hybrid.Redis().Get(ctx)
 	if err != nil {
 		t.Fatalf("Redis Get error: %v", err)
 	}
@@ -135,6 +138,7 @@ func TestHybridCache_SyncToRedis(t *testing.T) {
 }
 
 func TestHybridCache_LoadFromRedisError(t *testing.T) {
+	ctx := t.Context()
 	memConfig := cache.DefaultConfig[TestUser]().
 		WithPrimaryKey(func(u TestUser) string { return u.ID })
 	redisConfig := DefaultConfig()
@@ -142,13 +146,14 @@ func TestHybridCache_LoadFromRedisError(t *testing.T) {
 	// Use nil client to trigger error
 	hybrid := NewHybrid[TestUser](memConfig, nil, redisConfig)
 
-	err := hybrid.LoadFromRedis()
+	err := hybrid.LoadFromRedis(ctx)
 	if err == nil {
 		t.Error("Expected error when loading from Redis with nil client")
 	}
 }
 
 func TestHybridCache_SyncToRedisError(t *testing.T) {
+	ctx := t.Context()
 	memConfig := cache.DefaultConfig[TestUser]().
 		WithPrimaryKey(func(u TestUser) string { return u.ID })
 	redisConfig := DefaultConfig()
@@ -157,13 +162,14 @@ func TestHybridCache_SyncToRedisError(t *testing.T) {
 	hybrid := NewHybrid[TestUser](memConfig, nil, redisConfig)
 	hybrid.Memory().Set([]TestUser{{ID: "1"}})
 
-	err := hybrid.SyncToRedis()
+	err := hybrid.SyncToRedis(ctx)
 	if err == nil {
 		t.Error("Expected error when syncing to Redis with nil client")
 	}
 }
 
 func TestHybridCache_SetError(t *testing.T) {
+	ctx := t.Context()
 	memConfig := cache.DefaultConfig[TestUser]().
 		WithPrimaryKey(func(u TestUser) string { return u.ID })
 	redisConfig := DefaultConfig()
@@ -171,7 +177,7 @@ func TestHybridCache_SetError(t *testing.T) {
 	// Use nil client to trigger Redis error
 	hybrid := NewHybrid[TestUser](memConfig, nil, redisConfig)
 
-	err := hybrid.Set([]TestUser{{ID: "1"}})
+	err := hybrid.Set(ctx, []TestUser{{ID: "1"}})
 	if err == nil {
 		t.Error("Expected error when setting with nil Redis client")
 	}

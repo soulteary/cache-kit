@@ -24,32 +24,33 @@ var (
 // field was concretely typed; calling through the interface would panic
 // instead.
 func TestTypedNilClientIsNotAPanic(t *testing.T) {
+	ctx := t.Context()
 	var client *redis.Client // nil, but not a nil interface
 
 	c := New[TestUser](client, DefaultConfig().WithKeyPrefix("typednil:"))
 
-	if _, err := c.Get(); err == nil || !strings.Contains(err.Error(), "redis client is nil") {
+	if _, err := c.Get(ctx); err == nil || !strings.Contains(err.Error(), "redis client is nil") {
 		t.Errorf("Get() error = %v, want it to report the nil client", err)
 	}
-	if err := c.Set([]TestUser{{ID: "1"}}); err == nil {
+	if err := c.Set(ctx, []TestUser{{ID: "1"}}); err == nil {
 		t.Error("Set() error = nil, want it to report the nil client")
 	}
-	if _, err := c.Exists(); err == nil {
+	if _, err := c.Exists(ctx); err == nil {
 		t.Error("Exists() error = nil, want it to report the nil client")
 	}
-	if _, err := c.GetVersion(); err == nil {
+	if _, err := c.GetVersion(ctx); err == nil {
 		t.Error("GetVersion() error = nil, want it to report the nil client")
 	}
-	if _, err := c.TTL(); err == nil {
+	if _, err := c.TTL(ctx); err == nil {
 		t.Error("TTL() error = nil, want it to report the nil client")
 	}
-	if err := c.Refresh(); err == nil {
+	if err := c.Refresh(ctx); err == nil {
 		t.Error("Refresh() error = nil, want it to report the nil client")
 	}
-	if err := c.Clear(); err == nil {
+	if err := c.Clear(ctx); err == nil {
 		t.Error("Clear() error = nil, want it to report the nil client")
 	}
-	if err := c.SetWithTTL([]TestUser{{ID: "1"}}, 0); err == nil {
+	if err := c.SetWithTTL(ctx, []TestUser{{ID: "1"}}, 0); err == nil {
 		t.Error("SetWithTTL() error = nil, want it to report the nil client")
 	}
 }

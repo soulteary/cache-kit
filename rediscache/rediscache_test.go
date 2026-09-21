@@ -36,6 +36,7 @@ func setupMiniRedis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
 }
 
 func TestRedisCache_BasicOperations(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	config := DefaultConfig().
@@ -45,7 +46,7 @@ func TestRedisCache_BasicOperations(t *testing.T) {
 	cache := New[TestUser](client, config)
 
 	// Test empty cache
-	exists, err := cache.Exists()
+	exists, err := cache.Exists(ctx)
 	if err != nil {
 		t.Fatalf("Exists error: %v", err)
 	}
@@ -58,12 +59,12 @@ func TestRedisCache_BasicOperations(t *testing.T) {
 		{ID: "1", Email: "user1@example.com"},
 		{ID: "2", Email: "user2@example.com"},
 	}
-	if err := cache.Set(users); err != nil {
+	if err := cache.Set(ctx, users); err != nil {
 		t.Fatalf("Set error: %v", err)
 	}
 
 	// Test Exists after Set
-	exists, err = cache.Exists()
+	exists, err = cache.Exists(ctx)
 	if err != nil {
 		t.Fatalf("Exists error: %v", err)
 	}
@@ -72,7 +73,7 @@ func TestRedisCache_BasicOperations(t *testing.T) {
 	}
 
 	// Test Get
-	got, err := cache.Get()
+	got, err := cache.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get error: %v", err)
 	}
@@ -84,11 +85,11 @@ func TestRedisCache_BasicOperations(t *testing.T) {
 	}
 
 	// Test Clear
-	if err := cache.Clear(); err != nil {
+	if err := cache.Clear(ctx); err != nil {
 		t.Fatalf("Clear error: %v", err)
 	}
 
-	exists, err = cache.Exists()
+	exists, err = cache.Exists(ctx)
 	if err != nil {
 		t.Fatalf("Exists error: %v", err)
 	}
@@ -98,15 +99,16 @@ func TestRedisCache_BasicOperations(t *testing.T) {
 }
 
 func TestRedisCache_ClearAlsoRemovesVersion(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	config := DefaultConfig().WithKeyPrefix("test:")
 	cache := New[TestUser](client, config)
 
-	if err := cache.Set([]TestUser{{ID: "1"}}); err != nil {
+	if err := cache.Set(ctx, []TestUser{{ID: "1"}}); err != nil {
 		t.Fatalf("Set error: %v", err)
 	}
-	versionBefore, err := cache.GetVersion()
+	versionBefore, err := cache.GetVersion(ctx)
 	if err != nil {
 		t.Fatalf("GetVersion error: %v", err)
 	}
@@ -114,11 +116,11 @@ func TestRedisCache_ClearAlsoRemovesVersion(t *testing.T) {
 		t.Errorf("Expected version 1 before Clear, got %d", versionBefore)
 	}
 
-	if err := cache.Clear(); err != nil {
+	if err := cache.Clear(ctx); err != nil {
 		t.Fatalf("Clear error: %v", err)
 	}
 
-	versionAfter, err := cache.GetVersion()
+	versionAfter, err := cache.GetVersion(ctx)
 	if err != nil {
 		t.Fatalf("GetVersion error: %v", err)
 	}
@@ -128,12 +130,13 @@ func TestRedisCache_ClearAlsoRemovesVersion(t *testing.T) {
 }
 
 func TestRedisCache_Version(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	cache := New[TestUser](client, DefaultConfig())
 
 	// Initial version
-	version, err := cache.GetVersion()
+	version, err := cache.GetVersion(ctx)
 	if err != nil {
 		t.Fatalf("GetVersion error: %v", err)
 	}
@@ -142,10 +145,10 @@ func TestRedisCache_Version(t *testing.T) {
 	}
 
 	// Version after Set
-	if err := cache.Set([]TestUser{{ID: "1"}}); err != nil {
+	if err := cache.Set(ctx, []TestUser{{ID: "1"}}); err != nil {
 		t.Fatalf("Set error: %v", err)
 	}
-	version1, err := cache.GetVersion()
+	version1, err := cache.GetVersion(ctx)
 	if err != nil {
 		t.Fatalf("GetVersion error: %v", err)
 	}
@@ -154,10 +157,10 @@ func TestRedisCache_Version(t *testing.T) {
 	}
 
 	// Version increments on each Set
-	if err := cache.Set([]TestUser{{ID: "2"}}); err != nil {
+	if err := cache.Set(ctx, []TestUser{{ID: "2"}}); err != nil {
 		t.Fatalf("Set error: %v", err)
 	}
-	version2, err := cache.GetVersion()
+	version2, err := cache.GetVersion(ctx)
 	if err != nil {
 		t.Fatalf("GetVersion error: %v", err)
 	}
@@ -167,17 +170,18 @@ func TestRedisCache_Version(t *testing.T) {
 }
 
 func TestRedisCache_SetWithTTL(t *testing.T) {
+	ctx := t.Context()
 	mr, client := setupMiniRedis(t)
 
 	cache := NewWithKey[TestUser](client, "custom:key", DefaultConfig())
 
 	users := []TestUser{{ID: "1"}}
-	if err := cache.SetWithTTL(users, 10*time.Second); err != nil {
+	if err := cache.SetWithTTL(ctx, users, 10*time.Second); err != nil {
 		t.Fatalf("SetWithTTL error: %v", err)
 	}
 
 	// Check TTL was set
-	ttl, err := cache.TTL()
+	ttl, err := cache.TTL(ctx)
 	if err != nil {
 		t.Fatalf("TTL error: %v", err)
 	}
@@ -189,7 +193,7 @@ func TestRedisCache_SetWithTTL(t *testing.T) {
 	mr.FastForward(11 * time.Second)
 
 	// Should be expired
-	exists, err := cache.Exists()
+	exists, err := cache.Exists(ctx)
 	if err != nil {
 		t.Fatalf("Exists error: %v", err)
 	}
@@ -199,12 +203,13 @@ func TestRedisCache_SetWithTTL(t *testing.T) {
 }
 
 func TestRedisCache_Refresh(t *testing.T) {
+	ctx := t.Context()
 	mr, client := setupMiniRedis(t)
 
 	config := DefaultConfig().WithTTL(10 * time.Second)
 	cache := New[TestUser](client, config)
 
-	if err := cache.Set([]TestUser{{ID: "1"}}); err != nil {
+	if err := cache.Set(ctx, []TestUser{{ID: "1"}}); err != nil {
 		t.Fatalf("Set error: %v", err)
 	}
 
@@ -212,12 +217,12 @@ func TestRedisCache_Refresh(t *testing.T) {
 	mr.FastForward(5 * time.Second)
 
 	// Refresh TTL
-	if err := cache.Refresh(); err != nil {
+	if err := cache.Refresh(ctx); err != nil {
 		t.Fatalf("Refresh error: %v", err)
 	}
 
 	// TTL should be reset to 10 seconds
-	ttl, err := cache.TTL()
+	ttl, err := cache.TTL(ctx)
 	if err != nil {
 		t.Fatalf("TTL error: %v", err)
 	}
@@ -227,38 +232,40 @@ func TestRedisCache_Refresh(t *testing.T) {
 }
 
 func TestRedisCache_NilClient(t *testing.T) {
+	ctx := t.Context()
 	cache := New[TestUser](nil, nil)
 
-	if _, err := cache.Get(); err == nil {
+	if _, err := cache.Get(ctx); err == nil {
 		t.Error("Expected error with nil client")
 	}
-	if err := cache.Set([]TestUser{}); err == nil {
+	if err := cache.Set(ctx, []TestUser{}); err == nil {
 		t.Error("Expected error with nil client")
 	}
-	if _, err := cache.Exists(); err == nil {
+	if _, err := cache.Exists(ctx); err == nil {
 		t.Error("Expected error with nil client")
 	}
-	if _, err := cache.GetVersion(); err == nil {
+	if _, err := cache.GetVersion(ctx); err == nil {
 		t.Error("Expected error with nil client")
 	}
-	if err := cache.Clear(); err == nil {
+	if err := cache.Clear(ctx); err == nil {
 		t.Error("Expected error with nil client")
 	}
-	if _, err := cache.TTL(); err == nil {
+	if _, err := cache.TTL(ctx); err == nil {
 		t.Error("Expected error with nil client")
 	}
-	if err := cache.Refresh(); err == nil {
+	if err := cache.Refresh(ctx); err == nil {
 		t.Error("Expected error with nil client")
 	}
 }
 
 func TestRedisCache_EmptyGet(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	cache := New[TestUser](client, nil)
 
 	// Get on non-existent key should return empty slice
-	got, err := cache.Get()
+	got, err := cache.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get error: %v", err)
 	}
@@ -268,15 +275,17 @@ func TestRedisCache_EmptyGet(t *testing.T) {
 }
 
 func TestRedisCache_SetWithTTLNilClient(t *testing.T) {
+	ctx := t.Context()
 	cache := New[TestUser](nil, nil)
 
-	err := cache.SetWithTTL([]TestUser{{ID: "1"}}, 10*time.Second)
+	err := cache.SetWithTTL(ctx, []TestUser{{ID: "1"}}, 10*time.Second)
 	if err == nil {
 		t.Error("Expected error with nil client")
 	}
 }
 
 func TestRedisCache_GetInvalidJSON(t *testing.T) {
+	ctx := t.Context()
 	mr, client := setupMiniRedis(t)
 
 	config := DefaultConfig()
@@ -287,13 +296,14 @@ func TestRedisCache_GetInvalidJSON(t *testing.T) {
 		t.Fatalf("Failed to set invalid JSON: %v", err)
 	}
 
-	_, err := cache.Get()
+	_, err := cache.Get(ctx)
 	if err == nil {
 		t.Error("Expected error for invalid JSON")
 	}
 }
 
 func TestRedisCache_GetOversizedValue(t *testing.T) {
+	ctx := t.Context()
 	mr, client := setupMiniRedis(t)
 
 	config := DefaultConfig().WithKeyPrefix("test:").WithMaxValueBytes(10)
@@ -304,7 +314,7 @@ func TestRedisCache_GetOversizedValue(t *testing.T) {
 		t.Fatalf("Failed to set value: %v", err)
 	}
 
-	_, err := cache.Get()
+	_, err := cache.Get(ctx)
 	if err == nil {
 		t.Error("Expected error when value exceeds MaxValueBytes")
 	}
@@ -314,17 +324,18 @@ func TestRedisCache_GetOversizedValue(t *testing.T) {
 }
 
 func TestRedisCache_DefaultNilConfig(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	// Test NewRedisCache with nil config
 	cache := New[TestUser](client, nil)
 
 	users := []TestUser{{ID: "1", Name: "Test"}}
-	if err := cache.Set(users); err != nil {
+	if err := cache.Set(ctx, users); err != nil {
 		t.Fatalf("Set error: %v", err)
 	}
 
-	got, err := cache.Get()
+	got, err := cache.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get error: %v", err)
 	}
@@ -334,17 +345,18 @@ func TestRedisCache_DefaultNilConfig(t *testing.T) {
 }
 
 func TestRedisCacheWithKey_NilConfig(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	// Test NewRedisCacheWithKey with nil config
 	cache := NewWithKey[TestUser](client, "mykey", nil)
 
 	users := []TestUser{{ID: "1", Name: "Test"}}
-	if err := cache.Set(users); err != nil {
+	if err := cache.Set(ctx, users); err != nil {
 		t.Fatalf("Set error: %v", err)
 	}
 
-	exists, err := cache.Exists()
+	exists, err := cache.Exists(ctx)
 	if err != nil {
 		t.Fatalf("Exists error: %v", err)
 	}
@@ -354,6 +366,7 @@ func TestRedisCacheWithKey_NilConfig(t *testing.T) {
 }
 
 func TestRedisCache_VersionKey(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	config := DefaultConfig().
@@ -362,11 +375,11 @@ func TestRedisCache_VersionKey(t *testing.T) {
 
 	cache := New[TestUser](client, config)
 
-	if err := cache.Set([]TestUser{{ID: "1"}}); err != nil {
+	if err := cache.Set(ctx, []TestUser{{ID: "1"}}); err != nil {
 		t.Fatalf("Set error: %v", err)
 	}
 
-	version, err := cache.GetVersion()
+	version, err := cache.GetVersion(ctx)
 	if err != nil {
 		t.Fatalf("GetVersion error: %v", err)
 	}
@@ -376,6 +389,7 @@ func TestRedisCache_VersionKey(t *testing.T) {
 }
 
 func TestRedisCache_GetWithMaxValueBytesDisabled(t *testing.T) {
+	ctx := t.Context()
 	mr, client := setupMiniRedis(t)
 
 	config := DefaultConfig().WithKeyPrefix("test:").WithMaxValueBytes(0)
@@ -387,7 +401,7 @@ func TestRedisCache_GetWithMaxValueBytesDisabled(t *testing.T) {
 		t.Fatalf("Failed to set value: %v", err)
 	}
 
-	got, err := cache.Get()
+	got, err := cache.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get with MaxValueBytes=0 should not reject by size: %v", err)
 	}
@@ -397,6 +411,7 @@ func TestRedisCache_GetWithMaxValueBytesDisabled(t *testing.T) {
 }
 
 func TestRedisCache_GetValueAtExactMaxSize(t *testing.T) {
+	ctx := t.Context()
 	mr, client := setupMiniRedis(t)
 
 	// Boundary: value length exactly equal to MaxValueBytes should be accepted (no "exceeds max" error)
@@ -408,7 +423,7 @@ func TestRedisCache_GetValueAtExactMaxSize(t *testing.T) {
 		t.Fatalf("Failed to set value: %v", err)
 	}
 
-	got, err := cache.Get()
+	got, err := cache.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get at exact max size should succeed: %v", err)
 	}
@@ -418,6 +433,7 @@ func TestRedisCache_GetValueAtExactMaxSize(t *testing.T) {
 }
 
 func TestRedisCache_TTLFallbackWhenZero(t *testing.T) {
+	ctx := t.Context()
 	mr, client := setupMiniRedis(t)
 
 	config := DefaultConfig().
@@ -425,11 +441,11 @@ func TestRedisCache_TTLFallbackWhenZero(t *testing.T) {
 		WithTTL(0) // Invalid/zero TTL - should use 1h fallback
 	cache := New[TestUser](client, config)
 
-	if err := cache.Set([]TestUser{{ID: "1"}}); err != nil {
+	if err := cache.Set(ctx, []TestUser{{ID: "1"}}); err != nil {
 		t.Fatalf("Set with TTL=0 should use fallback and succeed: %v", err)
 	}
 
-	ttl, err := cache.TTL()
+	ttl, err := cache.TTL(ctx)
 	if err != nil {
 		t.Fatalf("TTL error: %v", err)
 	}
@@ -439,7 +455,7 @@ func TestRedisCache_TTLFallbackWhenZero(t *testing.T) {
 
 	// Key should eventually expire with fallback TTL (e.g. 1h); fast-forward to verify if miniredis supports it
 	mr.FastForward(2 * time.Hour)
-	exists, err := cache.Exists()
+	exists, err := cache.Exists(ctx)
 	if err != nil {
 		t.Fatalf("Exists error: %v", err)
 	}
@@ -449,17 +465,18 @@ func TestRedisCache_TTLFallbackWhenZero(t *testing.T) {
 }
 
 func TestRedisCache_SetWithTTLZeroUsesFallback(t *testing.T) {
+	ctx := t.Context()
 	_, client := setupMiniRedis(t)
 
 	config := DefaultConfig().WithKeyPrefix("ttl2:")
 	cache := New[TestUser](client, config)
 
-	err := cache.SetWithTTL([]TestUser{{ID: "1"}}, 0)
+	err := cache.SetWithTTL(ctx, []TestUser{{ID: "1"}}, 0)
 	if err != nil {
 		t.Fatalf("SetWithTTL with 0 should use fallback: %v", err)
 	}
 
-	ttl, err := cache.TTL()
+	ttl, err := cache.TTL(ctx)
 	if err != nil {
 		t.Fatalf("TTL error: %v", err)
 	}

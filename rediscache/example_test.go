@@ -1,6 +1,7 @@
 package rediscache_test
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/alicebob/miniredis/v2"
@@ -25,20 +26,21 @@ func newTestClient() *redis.Client {
 // The common case: keep a value set in Redis, with a version that goes up on
 // every write so other processes can tell there is something new to read.
 func Example() {
+	ctx := context.Background()
 	client := newTestClient()
 	defer func() { _ = client.Close() }()
 
 	c := rediscache.New[User](client, rediscache.DefaultConfig().WithKeyPrefix("users:"))
 
-	if err := c.Set([]User{{ID: "1", Email: "ada@example.com"}}); err != nil {
+	if err := c.Set(ctx, []User{{ID: "1", Email: "ada@example.com"}}); err != nil {
 		panic(err)
 	}
 
-	users, err := c.Get()
+	users, err := c.Get(ctx)
 	if err != nil {
 		panic(err)
 	}
-	version, err := c.GetVersion()
+	version, err := c.GetVersion(ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -50,12 +52,13 @@ func Example() {
 // A missing key is an empty result, not an error -- a cold cache is a normal
 // state, not a failure.
 func ExampleCache_Get() {
+	ctx := context.Background()
 	client := newTestClient()
 	defer func() { _ = client.Close() }()
 
 	c := rediscache.New[User](client, rediscache.DefaultConfig().WithKeyPrefix("cold:"))
 
-	users, err := c.Get()
+	users, err := c.Get(ctx)
 	fmt.Println(len(users), err)
 	// Output: 0 <nil>
 }
@@ -63,6 +66,7 @@ func ExampleCache_Get() {
 // Hybrid serves reads from memory and writes through to Redis, so a lookup
 // costs no round trip while the data still outlives the process.
 func ExampleHybrid() {
+	ctx := context.Background()
 	client := newTestClient()
 	defer func() { _ = client.Close() }()
 
@@ -70,7 +74,7 @@ func ExampleHybrid() {
 	h := rediscache.NewHybrid(memory, client, rediscache.DefaultConfig().WithKeyPrefix("hybrid:"))
 	h.AddIndex("email", func(u User) string { return u.Email })
 
-	if err := h.Set([]User{{ID: "1", Email: "ada@example.com"}}); err != nil {
+	if err := h.Set(ctx, []User{{ID: "1", Email: "ada@example.com"}}); err != nil {
 		panic(err)
 	}
 
@@ -80,7 +84,7 @@ func ExampleHybrid() {
 
 	// A second process starts cold and loads what the first one wrote.
 	other := rediscache.NewHybrid(memory, client, rediscache.DefaultConfig().WithKeyPrefix("hybrid:"))
-	if err := other.LoadFromRedis(); err != nil {
+	if err := other.LoadFromRedis(ctx); err != nil {
 		panic(err)
 	}
 	fmt.Println(other.GetAll()[0].Email)

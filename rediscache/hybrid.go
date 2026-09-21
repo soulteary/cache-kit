@@ -1,6 +1,8 @@
 package rediscache
 
 import (
+	"context"
+
 	cache "github.com/soulteary/cache-kit/v2"
 )
 
@@ -29,9 +31,9 @@ func (c *Hybrid[V]) AddIndex(name string, keyFunc cache.KeyFunc[V]) {
 // Memory is updated first, then Redis. If the Redis write fails, memory already holds the new data
 // while Redis may still have the old data; the error is returned and the caller should
 // retry or call LoadFromRedis to reconcile (e.g. clear memory or reload from Redis).
-func (c *Hybrid[V]) Set(values []V) error {
+func (c *Hybrid[V]) Set(ctx context.Context, values []V) error {
 	c.memory.Set(values)
-	return c.redis.Set(values)
+	return c.redis.Set(ctx, values)
 }
 
 // GetByIndex retrieves a value from the memory cache by index.
@@ -45,8 +47,8 @@ func (c *Hybrid[V]) GetAll() []V {
 }
 
 // LoadFromRedis loads data from Redis into the memory cache.
-func (c *Hybrid[V]) LoadFromRedis() error {
-	values, err := c.redis.Get()
+func (c *Hybrid[V]) LoadFromRedis(ctx context.Context) error {
+	values, err := c.redis.Get(ctx)
 	if err != nil {
 		return err
 	}
@@ -55,9 +57,9 @@ func (c *Hybrid[V]) LoadFromRedis() error {
 }
 
 // SyncToRedis saves memory cache data to Redis.
-func (c *Hybrid[V]) SyncToRedis() error {
+func (c *Hybrid[V]) SyncToRedis(ctx context.Context) error {
 	values := c.memory.GetAll()
-	return c.redis.Set(values)
+	return c.redis.Set(ctx, values)
 }
 
 // Memory returns the underlying memory cache for direct access.
