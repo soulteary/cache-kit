@@ -1,6 +1,6 @@
 # cache-kit
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/cache-kit.svg)](https://pkg.go.dev/github.com/soulteary/cache-kit)
+[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/cache-kit/v2.svg)](https://pkg.go.dev/github.com/soulteary/cache-kit/v2)
 [![Go Report Card](.github/goreportcard.svg)](.github/goreportcard-report.md)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/soulteary/cache-kit/graph/badge.svg)](https://codecov.io/gh/soulteary/cache-kit)
@@ -11,27 +11,35 @@ A Go library for thread-safe, multi-index memory caching with Redis support.
 Look values up by any number of keys in O(1), detect content changes by a
 reproducible hash, and share the cache across instances through Redis.
 
+The root package depends on nothing outside the standard library. Redis lives
+in the `rediscache` subpackage, so a program that only caches in memory never
+links go-redis: 95 packages instead of 199, and a 3.99 MB binary instead of
+6.99 MB. See [Dependency footprint](#dependency-footprint).
+
 ## Features
 
 - **Multi-index lookup**: O(1) lookups by several keys (ID, email, phone, …)
 - **Thread-safe**: safe for concurrent readers and writers
 - **Reproducible change detection**: a content hash that is stable across processes
-- **Redis support**: a Redis adapter for distributed scenarios
+- **Redis support**: a Redis adapter in `./rediscache`, imported only if you use it
 - **Hybrid cache**: memory in front of Redis
+- **Stdlib-only root package**: Redis costs you nothing until you import it
 - **Generic**: works with any value type through Go generics
 - **Fluent configuration**: builder pattern for both configs
 
 ## Requirements
 
 - **Go 1.27+** (`go.mod` declares `go 1.27.0`)
-- `github.com/redis/go-redis/v9` for the Redis and hybrid caches
+- `github.com/redis/go-redis/v9` **only if** you import `./rediscache`; the root package needs nothing
 - Redis with `EVAL` support (any 2.6+) when `MaxValueBytes` is set
 
 ## Installation
 
 ```bash
-go get github.com/soulteary/cache-kit
+go get github.com/soulteary/cache-kit/v2
 ```
+
+Coming from v1? See [Upgrade Notes (v2.0.0)](#upgrade-notes-v200).
 
 ## Quick Start
 
@@ -43,7 +51,7 @@ package main
 import (
     "fmt"
 
-    cache "github.com/soulteary/cache-kit"
+    cache "github.com/soulteary/cache-kit/v2"
 )
 
 type User struct {
@@ -83,35 +91,38 @@ func main() {
 package main
 
 import (
+    "context"
     "fmt"
     "time"
 
     "github.com/redis/go-redis/v9"
-    cache "github.com/soulteary/cache-kit"
+    "github.com/soulteary/cache-kit/v2/rediscache"
 )
 
 func main() {
+    ctx := context.Background()
+
     client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
     defer client.Close()
 
-    config := cache.DefaultRedisConfig().
+    config := rediscache.DefaultConfig().
         WithKeyPrefix("myapp:users:").
         WithTTL(30 * time.Minute)
 
-    c := cache.NewRedisCache[User](client, config)
+    c := rediscache.New[User](client, config)
 
-    if err := c.Set([]User{{ID: "1", Name: "Alice"}}); err != nil {
+    if err := c.Set(ctx, []User{{ID: "1", Name: "Alice"}}); err != nil {
         panic(err)
     }
 
-    users, err := c.Get()
+    users, err := c.Get(ctx)
     if err != nil {
         panic(err)
     }
     _ = users
 
     // A monotonically increasing counter, useful for "has anyone else written?"
-    version, _ := c.GetVersion()
+    version, _ := c.GetVersion(ctx)
     fmt.Println("cache version:", version)
 }
 ```
@@ -122,31 +133,36 @@ func main() {
 package main
 
 import (
+    "context"
+
     "github.com/redis/go-redis/v9"
-    cache "github.com/soulteary/cache-kit"
+    cache "github.com/soulteary/cache-kit/v2"
+    "github.com/soulteary/cache-kit/v2/rediscache"
 )
 
 func main() {
+    ctx := context.Background()
+
     client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
     defer client.Close()
 
     memConfig := cache.DefaultConfig[User]().
         WithPrimaryKey(func(u User) string { return u.ID })
-    redisConfig := cache.DefaultRedisConfig().WithKeyPrefix("users:")
+    redisConfig := rediscache.DefaultConfig().WithKeyPrefix("users:")
 
-    c := cache.NewHybridCache[User](memConfig, client, redisConfig)
+    c := rediscache.NewHybrid[User](memConfig, client, redisConfig)
     c.AddIndex("email", func(u User) string { return u.Email })
 
     // Writes memory first, then Redis.
-    if err := c.Set([]User{{ID: "1", Email: "alice@example.com"}}); err != nil {
+    if err := c.Set(ctx, []User{{ID: "1", Email: "alice@example.com"}}); err != nil {
         panic(err)
     }
 
     user, ok := c.GetByIndex("email", "alice@example.com") // served from memory
     _, _ = user, ok
 
-    c.LoadFromRedis() // warm memory on startup
-    c.SyncToRedis()   // push memory to Redis
+    c.LoadFromRedis(ctx) // warm memory on startup
+    c.SyncToRedis(ctx)   // push memory to Redis
 }
 ```
 
@@ -290,7 +306,7 @@ config.OnIndexConflict = func(indexName, key, existingPK, newPK string) { /* …
 
 ### Redis cache
 
-- `KeyPrefix` and `VersionKeySuffix` must be non-empty; `NewRedisCacheWithKey`
+- `KeyPrefix` and `VersionKeySuffix` must be non-empty; `rediscache.NewWithKey`
   requires a non-empty key. Use a **unique prefix per cache** to avoid
   collisions and key-space pollution.
 - Both keys must be at most 512 bytes.
@@ -298,11 +314,11 @@ config.OnIndexConflict = func(indexName, key, existingPK, newPK string) { /* …
   version key = data key + `VersionKeySuffix` (e.g. `myapp:cache:data:version`).
 
 ```go
-config := cache.DefaultRedisConfig().
+config := rediscache.DefaultConfig().
     WithKeyPrefix("myapp:cache:").         // required, non-empty; default "cache:"
     WithVersionKeySuffix(":version").      // required, non-empty; default ":version"
     WithTTL(1 * time.Hour).                // applies to the DATA key; 0 means 1h at Set time
-    WithOperationTimeout(5 * time.Second). // per-operation timeout
+    WithOperationTimeout(5 * time.Second). // per-operation bound, on top of your context
     WithMaxValueBytes(4 * 1024 * 1024)     // refuse an oversized value on Get; default 16MiB
 ```
 
@@ -311,7 +327,7 @@ config := cache.DefaultRedisConfig().
 | `KeyPrefix` | `"cache:"` | make it unique per cache |
 | `VersionKeySuffix` | `":version"` | appended to the data key |
 | `TTL` | `1h` | data key only — the version key is persistent |
-| `OperationTimeout` | `5s` | bounds each Redis round trip |
+| `OperationTimeout` | `5s` | bounds each round trip on top of your context; `0` means no bound of its own |
 | `MaxValueBytes` | 16 MiB | `0` disables the check |
 
 `MaxValueBytes` is enforced inside Redis: a Lua script measures the key with
@@ -319,13 +335,45 @@ config := cache.DefaultRedisConfig().
 never transferred or allocated, and no other writer can swap the key between
 the measurement and the read. `Get` returns an error naming both sizes.
 
-`RedisCache` methods take no `context.Context`; each one builds its own from
-`context.Background()` bounded by `OperationTimeout`. Caller cancellation and
-trace context therefore do not reach Redis.
+Every method that talks to Redis takes a `context.Context`, so cancellation
+and trace context reach the server. `OperationTimeout` narrows that context
+rather than replacing it; set it to `0` to let your own deadline stand alone.
 
-**`HybridCache.Set`** writes memory first, then Redis. If Redis fails, memory
+**`Hybrid.Set`** writes memory first, then Redis. If Redis fails, memory
 already holds the new data — handle the error (retry, or call `LoadFromRedis`)
 to reconcile.
+
+**Cluster, Ring and Sentinel.** The constructors take `rediscache.Client` — the
+six commands this package issues — so `*redis.Client`, `*redis.ClusterClient`,
+`*redis.Ring` and `redis.UniversalClient` all work. On a sharded client, give
+the data and version keys a common hash tag (`KeyPrefix` `"{users}:"` rather
+than `"users:"`); `Set`, `SetWithTTL` and `Clear` write both in one
+transaction, and Redis refuses a `MULTI` that spans slots.
+
+## Dependency footprint
+
+Redis lives in `./rediscache`, so it is linked only by programs that import it.
+Measured for a program that imports the root package and nothing else, v1.7.0
+against v2.0.0 (`go build -trimpath`, Go 1.27.0, linux/amd64):
+
+| | v1.7.0 | v2.0.0 |
+|---|---|---|
+| Linked packages | 199 | 95 |
+| Modules in the build | 5 | 1 |
+| Binary size | 6,991,822 B | 3,991,817 B (**−42.9%**) |
+| Consumer `go.mod` indirect requires | 4 | 0 |
+| Consumer `go.sum` modules | 14 | 1 |
+
+The `go.sum` line is module graph pruning at work: a requirement that no
+imported package needs stays out of your checksums entirely. Importing
+`./rediscache` brings go-redis, `cespare/xxhash`, `go.uber.org/atomic` and
+`golang.org/x/sys` back — that is the price of the feature, paid by the
+programs that use it.
+
+One thing pruning does **not** do is insulate you from minimal version
+selection. If your program uses go-redis itself, this module's requirement
+still raises it: a program pinning `v9.7.0` and depending on cache-kit v2
+resolves to `v9.22.0`.
 
 ## API Reference
 
@@ -356,39 +404,100 @@ c.Iterate(func(v V) bool)
 c.GetHash() string
 ```
 
-### RedisCache
+### rediscache.Cache
 
 ```go
-c := cache.NewRedisCache[V](client, config)
-c := cache.NewRedisCacheWithKey[V](client, "custom:key", config)
+c := rediscache.New[V](client, config)
+c := rediscache.NewWithKey[V](client, "custom:key", config)
 
-c.Set(values) error
-c.SetWithTTL(values, ttl) error
-c.Get() ([]V, error)
-c.Clear() error   // removes data and version key; GetVersion() then returns 0
+c.Set(ctx, values) error
+c.SetWithTTL(ctx, values, ttl) error
+c.Get(ctx) ([]V, error)
+c.Clear(ctx) error   // removes data and version key; GetVersion() then returns 0
 
-c.Exists() (bool, error)
-c.GetVersion() (int64, error)
-c.TTL() (time.Duration, error)
-c.Refresh() error // extends the data TTL; leaves the version key persistent
+c.Exists(ctx) (bool, error)
+c.GetVersion(ctx) (int64, error)
+c.TTL(ctx) (time.Duration, error)
+c.Refresh(ctx) error // extends the data TTL; leaves the version key persistent
 ```
 
-### HybridCache
+### rediscache.Hybrid
 
 ```go
-c := cache.NewHybridCache[V](memConfig, redisClient, redisConfig)
+c := rediscache.NewHybrid[V](memConfig, redisClient, redisConfig)
 
 c.AddIndex(name, keyFunc)
-c.Set(values) error
-c.GetByIndex(indexName, key) (V, bool)
-c.GetAll() []V
+c.Set(ctx, values) error
+c.GetByIndex(indexName, key) (V, bool)   // memory only, no round trip
+c.GetAll() []V                           // memory only, no round trip
 
-c.LoadFromRedis() error
-c.SyncToRedis() error
+c.LoadFromRedis(ctx) error
+c.SyncToRedis(ctx) error
 
 c.Memory() *cache.MemoryCache[V]
-c.Redis() *cache.RedisCache[V]
+c.Redis() *rediscache.Cache[V]
 ```
+
+## Upgrade Notes (v2.0.0)
+
+Two breaking changes, released together so there is one import-path rewrite
+rather than two.
+
+**1. The Redis cache moved to `./rediscache`.** The root package no longer
+imports go-redis; see [Dependency footprint](#dependency-footprint) for what
+that saves. Deprecated shims in the root package were not an option — a shim
+has to import go-redis, which relinks it and gives back the whole benefit.
+
+The module path is therefore `github.com/soulteary/cache-kit/v2`. Everyone
+must update the import path, including programs with no Redis at all.
+
+| v1 | v2 |
+|---|---|
+| `cache.RedisCache[V]` | `rediscache.Cache[V]` |
+| `cache.NewRedisCache[V]` | `rediscache.New[V]` |
+| `cache.NewRedisCacheWithKey[V]` | `rediscache.NewWithKey[V]` |
+| `cache.RedisConfig` | `rediscache.Config` |
+| `cache.DefaultRedisConfig` | `rediscache.DefaultConfig` |
+| `cache.HybridCache[V]` | `rediscache.Hybrid[V]` |
+| `cache.NewHybridCache[V]` | `rediscache.NewHybrid[V]` |
+
+The memory cache — `MemoryCache`, `Config`, `DefaultConfig`,
+`NewMultiIndexCache`, `StringSorter`, the hashing and the index machinery — is
+unchanged apart from the `/v2` in its import path.
+
+**2. Every Redis operation takes a `context.Context`.** v1 rooted each call at
+`context.Background()`, so a cancelled request could not stop the round trip
+and no trace context reached the server. The methods could not gain a
+parameter without a major version, and this is that version.
+
+```go
+c.Set(values)             → c.Set(ctx, values)
+c.SetWithTTL(values, ttl) → c.SetWithTTL(ctx, values, ttl)
+c.Get()                   → c.Get(ctx)
+c.Exists()                → c.Exists(ctx)
+c.GetVersion()            → c.GetVersion(ctx)
+c.Clear()                 → c.Clear(ctx)
+c.TTL()                   → c.TTL(ctx)
+c.Refresh()               → c.Refresh(ctx)
+
+h.Set(values)             → h.Set(ctx, values)
+h.LoadFromRedis()         → h.LoadFromRedis(ctx)
+h.SyncToRedis()           → h.SyncToRedis(ctx)
+```
+
+`Hybrid`'s memory-only methods — `AddIndex`, `GetByIndex`, `GetAll`, `Memory`,
+`Redis` — are unchanged; they issue no commands.
+
+Two behaviour changes come with it. `OperationTimeout` now narrows the context
+you pass instead of replacing it, and a non-positive `OperationTimeout` means
+no bound of this package's own — in v1 it produced an already-expired context,
+so a `RedisConfig` built by hand rather than from `DefaultRedisConfig` failed
+every operation before it was issued.
+
+**Also in v2:** the constructors accept `rediscache.Client` instead of
+`*redis.Client`, so `*redis.ClusterClient`, `*redis.Ring` and
+`redis.UniversalClient` work without a wrapper. A nil client of a concrete
+type still yields the `redis client is nil` error rather than a panic.
 
 ## Upgrade Notes (v1.7.0)
 

@@ -1,18 +1,3 @@
-// Package cache provides multi-index memory cache with Redis support.
-//
-// This package offers a generic, thread-safe caching solution with the following features:
-//   - Multi-index lookup support (O(1) lookups by different keys)
-//   - Hash-based change detection
-//   - Redis cache adapter for distributed scenarios
-//   - Automatic TTL management
-//
-// Example usage:
-//
-//	config := cache.DefaultConfig[User]().WithPrimaryKey(func(u User) string { return u.ID })
-//	cache := cache.NewMultiIndexCache[User](config)
-//	cache.AddIndex("email", func(u User) string { return u.Email })
-//	cache.Set(users)
-//	user, ok := cache.GetByIndex("email", "user@example.com")
 package cache
 
 // Cache provides the basic cache interface.

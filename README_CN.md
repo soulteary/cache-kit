@@ -1,6 +1,6 @@
 # cache-kit
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/cache-kit.svg)](https://pkg.go.dev/github.com/soulteary/cache-kit)
+[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/cache-kit/v2.svg)](https://pkg.go.dev/github.com/soulteary/cache-kit/v2)
 [![Go Report Card](.github/goreportcard.svg)](.github/goreportcard-report.md)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/soulteary/cache-kit/graph/badge.svg)](https://codecov.io/gh/soulteary/cache-kit)
@@ -10,27 +10,34 @@
 线程安全的多索引内存缓存库，支持 Redis。可以用任意多个键做 O(1) 查找，用可复现的
 哈希做内容变更检测，并通过 Redis 在多实例间共享缓存。
 
+根包只依赖标准库。Redis 放在 `rediscache` 子包里，所以只用内存缓存的程序根本不会
+链接 go-redis：链接包数 95 而不是 199，二进制 3.99 MB 而不是 6.99 MB。详见
+[依赖体积](#依赖体积)。
+
 ## 特性
 
 - **多索引查找**：按多个键（ID、邮箱、手机号……）做 O(1) 查找
 - **线程安全**：并发读写安全
 - **可复现的变更检测**：跨进程稳定的内容哈希
-- **Redis 支持**：用于分布式场景的 Redis 适配器
+- **Redis 支持**：`./rediscache` 子包里的 Redis 适配器，用到才导入
 - **混合缓存**：内存在前，Redis 在后
+- **根包零第三方依赖**：不导入 `rediscache`，Redis 就一分钱不花
 - **泛型**：基于 Go 泛型，适用于任意值类型
 - **链式配置**：两套配置都支持构造器风格
 
 ## 要求
 
 - **Go 1.27+**（`go.mod` 声明 `go 1.27.0`）
-- Redis 与混合缓存需要 `github.com/redis/go-redis/v9`
+- **仅当**导入 `./rediscache` 时才需要 `github.com/redis/go-redis/v9`；根包什么都不需要
 - 设置了 `MaxValueBytes` 时，Redis 需支持 `EVAL`（2.6+ 均可）
 
 ## 安装
 
 ```bash
-go get github.com/soulteary/cache-kit
+go get github.com/soulteary/cache-kit/v2
 ```
+
+从 v1 升级？见 [升级说明（v2.0.0）](#升级说明v200)。
 
 ## 快速开始
 
@@ -42,7 +49,7 @@ package main
 import (
     "fmt"
 
-    cache "github.com/soulteary/cache-kit"
+    cache "github.com/soulteary/cache-kit/v2"
 )
 
 type User struct {
@@ -82,35 +89,38 @@ func main() {
 package main
 
 import (
+    "context"
     "fmt"
     "time"
 
     "github.com/redis/go-redis/v9"
-    cache "github.com/soulteary/cache-kit"
+    "github.com/soulteary/cache-kit/v2/rediscache"
 )
 
 func main() {
+    ctx := context.Background()
+
     client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
     defer client.Close()
 
-    config := cache.DefaultRedisConfig().
+    config := rediscache.DefaultConfig().
         WithKeyPrefix("myapp:users:").
         WithTTL(30 * time.Minute)
 
-    c := cache.NewRedisCache[User](client, config)
+    c := rediscache.New[User](client, config)
 
-    if err := c.Set([]User{{ID: "1", Name: "Alice"}}); err != nil {
+    if err := c.Set(ctx, []User{{ID: "1", Name: "Alice"}}); err != nil {
         panic(err)
     }
 
-    users, err := c.Get()
+    users, err := c.Get(ctx)
     if err != nil {
         panic(err)
     }
     _ = users
 
     // 单调递增计数器，用来回答"是否有别人写过"。
-    version, _ := c.GetVersion()
+    version, _ := c.GetVersion(ctx)
     fmt.Println("缓存版本:", version)
 }
 ```
@@ -121,31 +131,36 @@ func main() {
 package main
 
 import (
+    "context"
+
     "github.com/redis/go-redis/v9"
-    cache "github.com/soulteary/cache-kit"
+    cache "github.com/soulteary/cache-kit/v2"
+    "github.com/soulteary/cache-kit/v2/rediscache"
 )
 
 func main() {
+    ctx := context.Background()
+
     client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
     defer client.Close()
 
     memConfig := cache.DefaultConfig[User]().
         WithPrimaryKey(func(u User) string { return u.ID })
-    redisConfig := cache.DefaultRedisConfig().WithKeyPrefix("users:")
+    redisConfig := rediscache.DefaultConfig().WithKeyPrefix("users:")
 
-    c := cache.NewHybridCache[User](memConfig, client, redisConfig)
+    c := rediscache.NewHybrid[User](memConfig, client, redisConfig)
     c.AddIndex("email", func(u User) string { return u.Email })
 
     // 先写内存，再写 Redis。
-    if err := c.Set([]User{{ID: "1", Email: "alice@example.com"}}); err != nil {
+    if err := c.Set(ctx, []User{{ID: "1", Email: "alice@example.com"}}); err != nil {
         panic(err)
     }
 
     user, ok := c.GetByIndex("email", "alice@example.com") // 由内存响应
     _, _ = user, ok
 
-    c.LoadFromRedis() // 启动时预热内存
-    c.SyncToRedis()   // 把内存推到 Redis
+    c.LoadFromRedis(ctx) // 启动时预热内存
+    c.SyncToRedis(ctx)   // 把内存推到 Redis
 }
 ```
 
@@ -277,18 +292,18 @@ config.OnIndexConflict = func(indexName, key, existingPK, newPK string) { /* …
 
 ### Redis 缓存
 
-- `KeyPrefix` 和 `VersionKeySuffix` 必须非空；`NewRedisCacheWithKey` 要求 key 非空。
+- `KeyPrefix` 和 `VersionKeySuffix` 必须非空；`rediscache.NewWithKey` 要求 key 非空。
   **每个缓存用独立前缀**，避免键冲突和键空间污染。
 - 两个键都不得超过 512 字节。
 - 实际键：数据键 = `KeyPrefix + "data"`（如 `myapp:cache:data`）；
   版本键 = 数据键 + `VersionKeySuffix`（如 `myapp:cache:data:version`）。
 
 ```go
-config := cache.DefaultRedisConfig().
+config := rediscache.DefaultConfig().
     WithKeyPrefix("myapp:cache:").         // 必填非空，默认 "cache:"
     WithVersionKeySuffix(":version").      // 必填非空，默认 ":version"
     WithTTL(1 * time.Hour).                // 作用于数据键；0 表示 Set 时按 1h
-    WithOperationTimeout(5 * time.Second). // 单次操作超时
+    WithOperationTimeout(5 * time.Second). // 在你传入的 context 之上再加一层超时
     WithMaxValueBytes(4 * 1024 * 1024)     // Get 时拒绝超大值，默认 16MiB
 ```
 
@@ -297,19 +312,47 @@ config := cache.DefaultRedisConfig().
 | `KeyPrefix` | `"cache:"` | 每个缓存保持唯一 |
 | `VersionKeySuffix` | `":version"` | 追加在数据键之后 |
 | `TTL` | `1h` | 只作用于数据键——版本键是持久的 |
-| `OperationTimeout` | `5s` | 约束每次 Redis 往返 |
+| `OperationTimeout` | `5s` | 在你的 context 之上约束每次往返；`0` 表示本包不额外加限制 |
 | `MaxValueBytes` | 16 MiB | `0` 表示不检查 |
 
 `MaxValueBytes` 在 Redis 内部生效：一段 Lua 脚本用 `STRLEN` 量出大小，并在同一次
 往返里返回值，所以超大值既不会被传输也不会被分配，也不会有别的写入方在"量"和"读"
 之间替换这个键。`Get` 返回的错误会同时给出两个尺寸。
 
-`RedisCache` 的方法都不接收 `context.Context`；每次调用都基于
-`context.Background()` 自建一个，用 `OperationTimeout` 约束。因此调用方的取消信号和
-追踪上下文不会传到 Redis。
+所有访问 Redis 的方法都接收 `context.Context`，取消信号和追踪上下文因此能传到
+服务端。`OperationTimeout` 是在你传入的 context 之上收紧，而不是替换它；设成 `0`
+就完全听你自己的 deadline。
 
-**`HybridCache.Set`** 先写内存、再写 Redis。Redis 失败时内存已经是新数据——请处理
+**`Hybrid.Set`** 先写内存、再写 Redis。Redis 失败时内存已经是新数据——请处理
 这个错误（重试，或调用 `LoadFromRedis`）来对齐两边。
+
+**Cluster、Ring 与 Sentinel。** 构造函数接收 `rediscache.Client`——也就是本包实际
+用到的那几个命令——所以 `*redis.Client`、`*redis.ClusterClient`、`*redis.Ring` 和
+`redis.UniversalClient` 都能直接传进来。用分片客户端时，请让数据键和版本键带同一个
+hash tag（`KeyPrefix` 写 `"{users}:"` 而不是 `"users:"`）：`Set`、`SetWithTTL` 和
+`Clear` 在一个事务里写这两个键，而 Redis 不接受跨 slot 的 `MULTI`。
+
+## 依赖体积
+
+Redis 放在 `./rediscache` 里，只有导入它的程序才会链接。以一个只导入根包的程序为准，
+v1.7.0 与 v2.0.0 的实测对比（`go build -trimpath`，Go 1.27.0，linux/amd64）：
+
+| | v1.7.0 | v2.0.0 |
+|---|---|---|
+| 链接包数 | 199 | 95 |
+| 参与构建的模块数 | 5 | 1 |
+| 二进制大小 | 6,991,822 B | 3,991,817 B（**−42.9%**） |
+| 使用方 `go.mod` 的 indirect 条目 | 4 | 0 |
+| 使用方 `go.sum` 的模块数 | 14 | 1 |
+
+`go.sum` 这一行是 module graph pruning 的效果：没有任何被导入的包需要的依赖，根本
+不会进入你的校验和文件。导入 `./rediscache` 会把 go-redis、`cespare/xxhash`、
+`go.uber.org/atomic` 和 `golang.org/x/sys` 带回来——这是这个功能的成本，由真正用到
+它的程序来付。
+
+有一点 pruning 管不了：MVS（最小版本选择）。如果你的程序自己也用 go-redis，本模块的
+依赖声明仍然会把它顶上去——一个锁定 `v9.7.0` 又依赖 cache-kit v2 的程序，最终解析到
+`v9.22.0`。
 
 ## API 参考
 
@@ -340,39 +383,94 @@ c.Iterate(func(v V) bool)
 c.GetHash() string
 ```
 
-### RedisCache
+### rediscache.Cache
 
 ```go
-c := cache.NewRedisCache[V](client, config)
-c := cache.NewRedisCacheWithKey[V](client, "custom:key", config)
+c := rediscache.New[V](client, config)
+c := rediscache.NewWithKey[V](client, "custom:key", config)
 
-c.Set(values) error
-c.SetWithTTL(values, ttl) error
-c.Get() ([]V, error)
-c.Clear() error   // 同时删除数据键与版本键；之后 GetVersion() 返回 0
+c.Set(ctx, values) error
+c.SetWithTTL(ctx, values, ttl) error
+c.Get(ctx) ([]V, error)
+c.Clear(ctx) error   // 同时删除数据键与版本键；之后 GetVersion() 返回 0
 
-c.Exists() (bool, error)
-c.GetVersion() (int64, error)
-c.TTL() (time.Duration, error)
-c.Refresh() error // 延长数据键 TTL；版本键保持持久
+c.Exists(ctx) (bool, error)
+c.GetVersion(ctx) (int64, error)
+c.TTL(ctx) (time.Duration, error)
+c.Refresh(ctx) error // 延长数据键 TTL；版本键保持持久
 ```
 
-### HybridCache
+### rediscache.Hybrid
 
 ```go
-c := cache.NewHybridCache[V](memConfig, redisClient, redisConfig)
+c := rediscache.NewHybrid[V](memConfig, redisClient, redisConfig)
 
 c.AddIndex(name, keyFunc)
-c.Set(values) error
-c.GetByIndex(indexName, key) (V, bool)
-c.GetAll() []V
+c.Set(ctx, values) error
+c.GetByIndex(indexName, key) (V, bool)   // 只走内存，不产生往返
+c.GetAll() []V                           // 只走内存，不产生往返
 
-c.LoadFromRedis() error
-c.SyncToRedis() error
+c.LoadFromRedis(ctx) error
+c.SyncToRedis(ctx) error
 
 c.Memory() *cache.MemoryCache[V]
-c.Redis() *cache.RedisCache[V]
+c.Redis() *rediscache.Cache[V]
 ```
+
+## 升级说明（v2.0.0）
+
+两个破坏性改动一起发布，这样只需要改一次 import 路径，而不是两次。
+
+**1. Redis 缓存移到了 `./rediscache`。** 根包不再导入 go-redis，省下多少见
+[依赖体积](#依赖体积)。根包里留兼容 shim 是行不通的——shim 必须 import go-redis，
+一 import 就又链接回来，收益全没了。
+
+因此模块路径变成 `github.com/soulteary/cache-kit/v2`。所有人都要改 import 路径，
+包括完全不用 Redis 的程序。
+
+| v1 | v2 |
+|---|---|
+| `cache.RedisCache[V]` | `rediscache.Cache[V]` |
+| `cache.NewRedisCache[V]` | `rediscache.New[V]` |
+| `cache.NewRedisCacheWithKey[V]` | `rediscache.NewWithKey[V]` |
+| `cache.RedisConfig` | `rediscache.Config` |
+| `cache.DefaultRedisConfig` | `rediscache.DefaultConfig` |
+| `cache.HybridCache[V]` | `rediscache.Hybrid[V]` |
+| `cache.NewHybridCache[V]` | `rediscache.NewHybrid[V]` |
+
+内存缓存部分——`MemoryCache`、`Config`、`DefaultConfig`、`NewMultiIndexCache`、
+`StringSorter`，以及哈希和索引机制——除了 import 路径里的 `/v2`，没有任何变化。
+
+**2. 每个 Redis 操作都要传 `context.Context`。** v1 的每次调用都从
+`context.Background()` 起头，于是调用方取消了也停不下这次往返，追踪上下文也到不了
+服务端。这个问题不改签名就修不了，而改签名只能在大版本里做——就是这一版。
+
+```go
+c.Set(values)             → c.Set(ctx, values)
+c.SetWithTTL(values, ttl) → c.SetWithTTL(ctx, values, ttl)
+c.Get()                   → c.Get(ctx)
+c.Exists()                → c.Exists(ctx)
+c.GetVersion()            → c.GetVersion(ctx)
+c.Clear()                 → c.Clear(ctx)
+c.TTL()                   → c.TTL(ctx)
+c.Refresh()               → c.Refresh(ctx)
+
+h.Set(values)             → h.Set(ctx, values)
+h.LoadFromRedis()         → h.LoadFromRedis(ctx)
+h.SyncToRedis()           → h.SyncToRedis(ctx)
+```
+
+`Hybrid` 里只碰内存的方法——`AddIndex`、`GetByIndex`、`GetAll`、`Memory`、`Redis`
+——签名不变，它们本来就不发命令。
+
+随之而来两个行为变化：`OperationTimeout` 现在是在你传入的 context 之上收紧，而不是
+替换它；`OperationTimeout` 为 0 或负数表示本包不额外加限制——在 v1 里它会得到一个
+已经过期的 context，于是手写（而非用 `DefaultRedisConfig` 生成）的 `RedisConfig`
+会让每次操作在发出之前就失败。
+
+**v2 还有：** 构造函数接收 `rediscache.Client` 而不是 `*redis.Client`，所以
+`*redis.ClusterClient`、`*redis.Ring` 和 `redis.UniversalClient` 不用包一层就能用。
+传入具体类型的 nil 客户端仍然返回 `redis client is nil` 错误，而不是 panic。
 
 ## 升级说明（v1.7.0）
 

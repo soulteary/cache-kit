@@ -102,6 +102,35 @@ jobs:
           args: --timeout=5m
           only-new-issues: false
 
+  # The split of Redis into ./rediscache only pays off while the root package
+  # stays free of third-party imports. Nothing else checks that, and one
+  # careless import would quietly put go-redis back in every user's binary.
+  root-package-is-stdlib-only:
+    name: Root Package Imports Only The Standard Library
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go environment
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: No third-party module may reach the root package
+        run: |
+          set -euo pipefail
+          module="$(go list -m)"
+          external="$(go list -deps -f '{{if .Module}}{{.Module.Path}}{{end}}' . \
+            | sort -u | grep -v "^$module\$" | grep -v '^$' || true)"
+          if [ -n "$external" ]; then
+            echo "::error::the root package pulls in modules outside the standard library:"
+            echo "$external"
+            echo "Redis-only code belongs in ./rediscache."
+            exit 1
+          fi
+          echo "Root package depends on the standard library only."
+
   # Dependency security scan
   security-scan:
     name: Dependency Security Scan
