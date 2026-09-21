@@ -1,4 +1,4 @@
-module github.com/soulteary/cache-kit
+module github.com/soulteary/cache-kit/v2
 
 go 1.27.0
 

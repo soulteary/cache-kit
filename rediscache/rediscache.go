@@ -1,46 +1,160 @@
-package cache
+// Package rediscache stores a set of values in Redis, with a version counter
+// for change detection.
+//
+// It lives in its own package so that importing the root package does not drag
+// go-redis -- and with it cespare/xxhash, go.uber.org/atomic and
+// golang.org/x/sys -- into binaries that only ever use the memory cache. A
+// service that indexes a slice in RAM pays nothing for Redis support existing;
+// only importing this package links it in.
+//
+// The root package keeps everything that does not need a Redis client: the
+// memory cache, the index machinery and the content hash. This package adds
+// the Redis-backed cache and [Hybrid], which pairs the two.
+//
+//	c := rediscache.New[User](client, rediscache.DefaultConfig().WithKeyPrefix("users:"))
+//	if err := c.Set(users); err != nil {
+//		return err
+//	}
+package rediscache
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// maxRedisKeyLen is the maximum allowed length for a Redis key (data or version).
-// Prevents key space abuse and ensures predictable behavior.
-const maxRedisKeyLen = 512
+// Client is the part of a go-redis client this package uses. *redis.Client,
+// *redis.ClusterClient, *redis.Ring and redis.UniversalClient all satisfy it,
+// so the same cache works against a standalone server, a cluster and a
+// Sentinel failover setup.
+//
+// One caveat for the sharded clients: Set, SetWithTTL and Clear write the data
+// key and the version key in a single transactional pipeline, and Redis
+// refuses a MULTI spanning two slots. Give the pair a common hash tag --
+// KeyPrefix "{users}:" rather than "users:" -- so both keys land on the same
+// node.
+type Client interface {
+	redis.Scripter
 
-// validateRedisKeys panics if dataKey or versionKey are invalid: empty, identical, or too long.
-// Use a unique KeyPrefix (or key for NewRedisCacheWithKey) per cache to avoid key collision.
-func validateRedisKeys(dataKey, versionKey string) {
+	Get(ctx context.Context, key string) *redis.StringCmd
+	Exists(ctx context.Context, keys ...string) *redis.IntCmd
+	TTL(ctx context.Context, key string) *redis.DurationCmd
+	Pipeline() redis.Pipeliner
+	TxPipeline() redis.Pipeliner
+}
+
+// Config holds configuration for the Redis cache.
+type Config struct {
+	// KeyPrefix is prepended to all Redis keys. Use a unique prefix per cache to avoid key collision.
+	KeyPrefix string
+
+	// VersionKeySuffix is appended to the key prefix for version tracking.
+	// Default: ":version"
+	VersionKeySuffix string
+
+	// TTL is the default time-to-live for cached data. Must be positive; otherwise a default is used at Set time.
+	// Default: 1 hour
+	TTL time.Duration
+
+	// OperationTimeout is the timeout for Redis operations.
+	// Default: 5 seconds
+	OperationTimeout time.Duration
+
+	// MaxValueBytes limits the size of the value read from Redis in Get(). If <= 0, no limit is applied.
+	// Default: 16MB.
+	//
+	// The size is checked with STRLEN before the value is fetched, so an
+	// oversized value is never pulled into memory. Checking len(data) after
+	// GET, as this used to, only prevented the unmarshal -- the allocation the
+	// limit exists to avoid had already happened.
+	MaxValueBytes int
+}
+
+// Default max value size for Get (16 MiB).
+const defaultMaxValueBytes = 16 * 1024 * 1024
+
+// DefaultConfig returns a default Redis configuration.
+func DefaultConfig() *Config {
+	return &Config{
+		KeyPrefix:        "cache:",
+		VersionKeySuffix: ":version",
+		TTL:              1 * time.Hour,
+		OperationTimeout: 5 * time.Second,
+		MaxValueBytes:    defaultMaxValueBytes,
+	}
+}
+
+// WithKeyPrefix sets the key prefix.
+func (c *Config) WithKeyPrefix(prefix string) *Config {
+	c.KeyPrefix = prefix
+	return c
+}
+
+// WithVersionKeySuffix sets the version key suffix.
+func (c *Config) WithVersionKeySuffix(suffix string) *Config {
+	c.VersionKeySuffix = suffix
+	return c
+}
+
+// WithTTL sets the TTL.
+func (c *Config) WithTTL(ttl time.Duration) *Config {
+	c.TTL = ttl
+	return c
+}
+
+// WithOperationTimeout sets the operation timeout.
+func (c *Config) WithOperationTimeout(timeout time.Duration) *Config {
+	c.OperationTimeout = timeout
+	return c
+}
+
+// WithMaxValueBytes sets the maximum allowed size in bytes for a value read from Redis in Get().
+// Values larger than this are rejected to prevent OOM. Use 0 or negative to disable the limit.
+func (c *Config) WithMaxValueBytes(n int) *Config {
+	c.MaxValueBytes = n
+	return c
+}
+
+// maxKeyLen is the maximum allowed length for a Redis key (data or version).
+// Prevents key space abuse and ensures predictable behavior.
+const maxKeyLen = 512
+
+// errNilClient is returned by every method when there is no client to talk to.
+var errNilClient = errors.New("redis client is nil")
+
+// validateKeys panics if dataKey or versionKey are invalid: empty, identical, or too long.
+// Use a unique KeyPrefix (or key for NewWithKey) per cache to avoid key collision.
+func validateKeys(dataKey, versionKey string) {
 	if dataKey == "" {
 		panic("cache-kit: Redis data key must not be empty; use a non-empty KeyPrefix or key")
 	}
 	if versionKey == "" || versionKey == dataKey {
 		panic("cache-kit: Redis version key must not be empty and must differ from data key; set VersionKeySuffix")
 	}
-	if len(dataKey) > maxRedisKeyLen || len(versionKey) > maxRedisKeyLen {
+	if len(dataKey) > maxKeyLen || len(versionKey) > maxKeyLen {
 		panic("cache-kit: Redis key length must not exceed 512 bytes")
 	}
 }
 
-// RedisCache provides a Redis-based cache implementation.
+// Cache provides a Redis-based cache implementation.
 // It supports versioning for cache invalidation detection.
-type RedisCache[V any] struct {
-	client *redis.Client
-	config *RedisConfig
-	key    string // main data key
+type Cache[V any] struct {
+	client    Client
+	config    *Config
+	key       string // main data key
+	hasClient bool   // see isNil: guards against a typed nil in client
 }
 
-// NewRedisCache creates a new Redis cache with the given client and configuration.
+// New creates a new Redis cache with the given client and configuration.
 // KeyPrefix and VersionKeySuffix must be non-empty; use a unique prefix per cache to avoid key collision.
-func NewRedisCache[V any](client *redis.Client, config *RedisConfig) *RedisCache[V] {
+func New[V any](client Client, config *Config) *Cache[V] {
 	if config == nil {
-		config = DefaultRedisConfig()
+		config = DefaultConfig()
 	}
 	if config.KeyPrefix == "" {
 		panic("cache-kit: Redis KeyPrefix must not be empty; use a unique prefix per cache")
@@ -50,19 +164,20 @@ func NewRedisCache[V any](client *redis.Client, config *RedisConfig) *RedisCache
 	}
 	dataKey := config.KeyPrefix + "data"
 	versionKey := dataKey + config.VersionKeySuffix
-	validateRedisKeys(dataKey, versionKey)
-	return &RedisCache[V]{
-		client: client,
-		config: config,
-		key:    dataKey,
+	validateKeys(dataKey, versionKey)
+	return &Cache[V]{
+		client:    client,
+		config:    config,
+		key:       dataKey,
+		hasClient: !isNil(client),
 	}
 }
 
-// NewRedisCacheWithKey creates a new Redis cache with a custom key name.
+// NewWithKey creates a new Redis cache with a custom key name.
 // The key must be non-empty; VersionKeySuffix must be non-empty. Use a unique key per cache to avoid key collision.
-func NewRedisCacheWithKey[V any](client *redis.Client, key string, config *RedisConfig) *RedisCache[V] {
+func NewWithKey[V any](client Client, key string, config *Config) *Cache[V] {
 	if config == nil {
-		config = DefaultRedisConfig()
+		config = DefaultConfig()
 	}
 	if key == "" {
 		panic("cache-kit: Redis key must not be empty; use a unique key per cache")
@@ -71,11 +186,31 @@ func NewRedisCacheWithKey[V any](client *redis.Client, key string, config *Redis
 		panic("cache-kit: Redis VersionKeySuffix must not be empty")
 	}
 	versionKey := key + config.VersionKeySuffix
-	validateRedisKeys(key, versionKey)
-	return &RedisCache[V]{
-		client: client,
-		config: config,
-		key:    key,
+	validateKeys(key, versionKey)
+	return &Cache[V]{
+		client:    client,
+		config:    config,
+		key:       key,
+		hasClient: !isNil(client),
+	}
+}
+
+// isNil reports whether there is no client to talk to. Client is an interface,
+// so a plain client == nil misses the case that actually reaches here -- a nil
+// *redis.Client stored in it, which a caller gets from an unassigned field or
+// a constructor that returned early. Calling a command on that panics, where
+// the caller has every reason to expect the "redis client is nil" error the
+// concrete-typed version returned.
+func isNil(c Client) bool {
+	if c == nil {
+		return true
+	}
+	v := reflect.ValueOf(c)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
 	}
 }
 
@@ -85,17 +220,17 @@ func NewRedisCacheWithKey[V any](client *redis.Client, key string, config *Redis
 // trace context do not reach Redis. Every method here takes no context
 // parameter, so fixing that means changing the exported signatures; it is
 // called out rather than changed.
-func (c *RedisCache[V]) getContext() (context.Context, context.CancelFunc) {
+func (c *Cache[V]) getContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), c.config.OperationTimeout)
 }
 
 // versionKey returns the version key for this cache.
-func (c *RedisCache[V]) versionKey() string {
+func (c *Cache[V]) versionKey() string {
 	return c.key + c.config.VersionKeySuffix
 }
 
 // effectiveTTL returns the TTL to use; if the given ttl is <= 0, uses config TTL, or 1 hour as fallback.
-func (c *RedisCache[V]) effectiveTTL(ttl time.Duration) time.Duration {
+func (c *Cache[V]) effectiveTTL(ttl time.Duration) time.Duration {
 	if ttl > 0 {
 		return ttl
 	}
@@ -106,9 +241,9 @@ func (c *RedisCache[V]) effectiveTTL(ttl time.Duration) time.Duration {
 }
 
 // Set stores values in Redis and increments the version.
-func (c *RedisCache[V]) Set(values []V) error {
-	if c.client == nil {
-		return fmt.Errorf("redis client is nil")
+func (c *Cache[V]) Set(values []V) error {
+	if !c.hasClient {
+		return errNilClient
 	}
 
 	data, err := json.Marshal(values)
@@ -145,9 +280,9 @@ func (c *RedisCache[V]) Set(values []V) error {
 // Get retrieves values from Redis.
 // Returns an empty slice if the key doesn't exist.
 // If the stored value exceeds MaxValueBytes (when set in config), returns an error to prevent OOM.
-func (c *RedisCache[V]) Get() ([]V, error) {
-	if c.client == nil {
-		return nil, fmt.Errorf("redis client is nil")
+func (c *Cache[V]) Get() ([]V, error) {
+	if !c.hasClient {
+		return nil, errNilClient
 	}
 
 	ctx, cancel := c.getContext()
@@ -177,9 +312,9 @@ func (c *RedisCache[V]) Get() ([]V, error) {
 }
 
 // Exists checks if the cache key exists.
-func (c *RedisCache[V]) Exists() (bool, error) {
-	if c.client == nil {
-		return false, fmt.Errorf("redis client is nil")
+func (c *Cache[V]) Exists() (bool, error) {
+	if !c.hasClient {
+		return false, errNilClient
 	}
 
 	ctx, cancel := c.getContext()
@@ -195,16 +330,16 @@ func (c *RedisCache[V]) Exists() (bool, error) {
 
 // GetVersion returns the current cache version.
 // Returns 0 if the version key doesn't exist.
-func (c *RedisCache[V]) GetVersion() (int64, error) {
-	if c.client == nil {
-		return 0, fmt.Errorf("redis client is nil")
+func (c *Cache[V]) GetVersion() (int64, error) {
+	if !c.hasClient {
+		return 0, errNilClient
 	}
 
 	ctx, cancel := c.getContext()
 	defer cancel()
 
 	version, err := c.client.Get(ctx, c.versionKey()).Int64()
-	if err == redis.Nil {
+	if errors.Is(err, redis.Nil) {
 		return 0, nil
 	}
 	if err != nil {
@@ -216,9 +351,9 @@ func (c *RedisCache[V]) GetVersion() (int64, error) {
 
 // Clear deletes the cache key and the version key.
 // After Clear(), GetVersion() returns 0 (version key is removed).
-func (c *RedisCache[V]) Clear() error {
-	if c.client == nil {
-		return fmt.Errorf("redis client is nil")
+func (c *Cache[V]) Clear() error {
+	if !c.hasClient {
+		return errNilClient
 	}
 
 	ctx, cancel := c.getContext()
@@ -232,9 +367,9 @@ func (c *RedisCache[V]) Clear() error {
 }
 
 // SetWithTTL stores values with a custom TTL.
-func (c *RedisCache[V]) SetWithTTL(values []V, ttl time.Duration) error {
-	if c.client == nil {
-		return fmt.Errorf("redis client is nil")
+func (c *Cache[V]) SetWithTTL(values []V, ttl time.Duration) error {
+	if !c.hasClient {
+		return errNilClient
 	}
 
 	data, err := json.Marshal(values)
@@ -261,9 +396,9 @@ func (c *RedisCache[V]) SetWithTTL(values []V, ttl time.Duration) error {
 }
 
 // TTL returns the remaining TTL for the cache key.
-func (c *RedisCache[V]) TTL() (time.Duration, error) {
-	if c.client == nil {
-		return 0, fmt.Errorf("redis client is nil")
+func (c *Cache[V]) TTL() (time.Duration, error) {
+	if !c.hasClient {
+		return 0, errNilClient
 	}
 
 	ctx, cancel := c.getContext()
@@ -278,9 +413,9 @@ func (c *RedisCache[V]) TTL() (time.Duration, error) {
 }
 
 // Refresh extends the TTL of the cache without changing the data.
-func (c *RedisCache[V]) Refresh() error {
-	if c.client == nil {
-		return fmt.Errorf("redis client is nil")
+func (c *Cache[V]) Refresh() error {
+	if !c.hasClient {
+		return errNilClient
 	}
 
 	ctx, cancel := c.getContext()
@@ -299,71 +434,6 @@ func (c *RedisCache[V]) Refresh() error {
 
 	_, err := pipe.Exec(ctx)
 	return err
-}
-
-// HybridCache combines memory cache with Redis for distributed scenarios.
-// It uses memory cache for fast local access and Redis for persistence/sharing.
-type HybridCache[V any] struct {
-	memory *MemoryCache[V]
-	redis  *RedisCache[V]
-}
-
-// NewHybridCache creates a new hybrid cache.
-func NewHybridCache[V any](memoryConfig *Config[V], redisClient *redis.Client, redisConfig *RedisConfig) *HybridCache[V] {
-	return &HybridCache[V]{
-		memory: NewMultiIndexCache(memoryConfig),
-		redis:  NewRedisCache[V](redisClient, redisConfig),
-	}
-}
-
-// AddIndex registers a new index on the memory cache.
-func (c *HybridCache[V]) AddIndex(name string, keyFunc KeyFunc[V]) {
-	c.memory.AddIndex(name, keyFunc)
-}
-
-// Set stores values in both memory and Redis.
-// Memory is updated first, then Redis. If Redis.Set fails, memory already holds the new data
-// while Redis may still have the old data; the error is returned and the caller should
-// retry or call LoadFromRedis to reconcile (e.g. clear memory or reload from Redis).
-func (c *HybridCache[V]) Set(values []V) error {
-	c.memory.Set(values)
-	return c.redis.Set(values)
-}
-
-// GetByIndex retrieves a value from memory cache by index.
-func (c *HybridCache[V]) GetByIndex(indexName string, key string) (V, bool) {
-	return c.memory.GetByIndex(indexName, key)
-}
-
-// GetAll returns all values from memory cache.
-func (c *HybridCache[V]) GetAll() []V {
-	return c.memory.GetAll()
-}
-
-// LoadFromRedis loads data from Redis into memory cache.
-func (c *HybridCache[V]) LoadFromRedis() error {
-	values, err := c.redis.Get()
-	if err != nil {
-		return err
-	}
-	c.memory.Set(values)
-	return nil
-}
-
-// SyncToRedis saves memory cache data to Redis.
-func (c *HybridCache[V]) SyncToRedis() error {
-	values := c.memory.GetAll()
-	return c.redis.Set(values)
-}
-
-// Memory returns the underlying memory cache for direct access.
-func (c *HybridCache[V]) Memory() *MemoryCache[V] {
-	return c.memory
-}
-
-// Redis returns the underlying Redis cache for direct access.
-func (c *HybridCache[V]) Redis() *RedisCache[V] {
-	return c.redis
 }
 
 // boundedGetScript measures a key and returns its value in one atomic step.
@@ -388,7 +458,7 @@ return {'ok', value}
 // getBounded fetches the cache value, refusing one over MaxValueBytes.
 //
 // It returns (nil, nil) when the key does not exist.
-func (c *RedisCache[V]) getBounded(ctx context.Context) ([]byte, error) {
+func (c *Cache[V]) getBounded(ctx context.Context) ([]byte, error) {
 	maxBytes := c.config.MaxValueBytes
 	if maxBytes <= 0 {
 		data, err := c.client.Get(ctx, c.key).Bytes()
