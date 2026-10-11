@@ -29,7 +29,7 @@ links go-redis: 95 packages instead of 199, and a 3.99 MB binary instead of
 
 ## Requirements
 
-- **Go 1.27+** (`go.mod` declares `go 1.27.0`)
+- **Go 1.27+** (`go.mod` declares `go 1.27.2`)
 - `github.com/redis/go-redis/v9` **only if** you import `./rediscache`; the root package needs nothing
 - Redis with `EVAL` support (any 2.6+) when `MaxValueBytes` is set
 

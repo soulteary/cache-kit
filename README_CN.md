@@ -27,7 +27,7 @@
 
 ## 要求
 
-- **Go 1.27+**（`go.mod` 声明 `go 1.27.0`）
+- **Go 1.27+**（`go.mod` 声明 `go 1.27.2`）
 - **仅当**导入 `./rediscache` 时才需要 `github.com/redis/go-redis/v9`；根包什么都不需要
 - 设置了 `MaxValueBytes` 时，Redis 需支持 `EVAL`（2.6+ 均可）
 
