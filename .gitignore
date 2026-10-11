@@ -28,3 +28,6 @@ Thumbs.db
 # Coverage
 coverage.out
 coverage.html
+
+# Raw Go report evidence is uploaded as artifacts, not committed.
+.github/test-results/
