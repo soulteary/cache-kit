@@ -26,9 +26,14 @@ links go-redis: 95 packages instead of 199, and a 3.99 MB binary instead of
 
 ## Requirements
 
-- **Go 1.27+** (`go.mod` declares `go 1.27.2`)
+- **Go 1.27.2+** (`go.mod` declares `go 1.27.2`)
 - `github.com/redis/go-redis/v9` **only if** you import `./rediscache`; the root package needs nothing
 - Redis with `EVAL` support (any 2.6+) when `MaxValueBytes` is set
+
+
+### Redis connection budgets
+
+The cache uses `Pipeline` and `TxPipeline` on the client supplied by the caller. With go-redis v9.23.0 or newer, callers that rely on `PoolSize` or `MaxActiveConns` as a connection budget must configure `PipelinePoolSize: -1` when creating each standalone, failover, cluster or ring client. Otherwise go-redis can create an additional dedicated pipeline pool. The cache does not own or mutate an existing client; its constructors cannot retroactively change that client’s pools. The examples below use the shared-pool setting.
 
 ## Installation
 
@@ -99,7 +104,7 @@ import (
 func main() {
     ctx := context.Background()
 
-    client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+    client := redis.NewClient(&redis.Options{Addr: "localhost:6379", PipelinePoolSize: -1})
     defer client.Close()
 
     config := rediscache.DefaultConfig().
@@ -140,7 +145,7 @@ import (
 func main() {
     ctx := context.Background()
 
-    client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+    client := redis.NewClient(&redis.Options{Addr: "localhost:6379", PipelinePoolSize: -1})
     defer client.Close()
 
     memConfig := cache.DefaultConfig[User]().

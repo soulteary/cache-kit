@@ -38,6 +38,11 @@ import (
 // refuses a MULTI spanning two slots. Give the pair a common hash tag --
 // KeyPrefix "{users}:" rather than "users:" -- so both keys land on the same
 // node.
+//
+// When using go-redis v9.23.0 or later with a connection budget, the caller
+// must create the client with PipelinePoolSize: -1. Otherwise its pipelines
+// can use a separate pool beyond PoolSize or MaxActiveConns. This package
+// uses the supplied client as-is and does not reconfigure its pools.
 type Client interface {
 	redis.Scripter
 
