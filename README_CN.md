@@ -24,9 +24,14 @@
 
 ## 要求
 
-- **Go 1.27+**（`go.mod` 声明 `go 1.27.2`）
+- **Go 1.27.2+**（`go.mod` 声明 `go 1.27.2`）
 - **仅当**导入 `./rediscache` 时才需要 `github.com/redis/go-redis/v9`；根包什么都不需要
 - 设置了 `MaxValueBytes` 时，Redis 需支持 `EVAL`（2.6+ 均可）
+
+
+### Redis 连接预算
+
+缓存通过调用者传入的客户端执行 `Pipeline` 和 `TxPipeline`。使用 go-redis v9.23.0 或更新版本时，如果依赖 `PoolSize` 或 `MaxActiveConns` 限制连接预算，必须在创建单机、Sentinel、Cluster 或 Ring 客户端时设置 `PipelinePoolSize: -1`；否则 go-redis 会额外使用独立的 pipeline 池。缓存不拥有或修改调用者的客户端，构造器无法事后改变现有连接池。下面的示例均使用共享连接池配置。
 
 ## 安装
 
@@ -97,7 +102,7 @@ import (
 func main() {
     ctx := context.Background()
 
-    client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+    client := redis.NewClient(&redis.Options{Addr: "localhost:6379", PipelinePoolSize: -1})
     defer client.Close()
 
     config := rediscache.DefaultConfig().
@@ -138,7 +143,7 @@ import (
 func main() {
     ctx := context.Background()
 
-    client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+    client := redis.NewClient(&redis.Options{Addr: "localhost:6379", PipelinePoolSize: -1})
     defer client.Close()
 
     memConfig := cache.DefaultConfig[User]().

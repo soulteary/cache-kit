@@ -20,7 +20,7 @@ type User struct {
 // go test. In a program this is the client you already have.
 func newTestClient() *redis.Client {
 	mr, _ := miniredis.Run()
-	return redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	return redis.NewClient(&redis.Options{Addr: mr.Addr(), PipelinePoolSize: -1})
 }
 
 // The common case: keep a value set in Redis, with a version that goes up on
