@@ -1,11 +1,11 @@
 # Go Report Card
 
-**Grade: B** (76.5%)
+**Grade: A+** (99.3%)
 
 | Metric | Value |
 | ------ | ----- |
 | Files | 18 |
-| Issues | 0 |
+| Issues | 1 |
 
 ## Checks
 
@@ -13,12 +13,17 @@
 | ----- | ----- |
 | gofmt | 100% |
 | go_vet | 100% |
-| ineffassign | 0% |
-| gocyclo | 0% |
+| gocyclo | 94% |
+| ineffassign | 100% |
 | license | 100% |
-| misspell | 0% |
+| misspell | 100% |
 
-No issues found. Nice work!
+## Issues
+
+### gocyclo
+
+- `config.go`
+  - Line 367: cyclomatic complexity 28 for function encodeForHash
 
 ---
 
