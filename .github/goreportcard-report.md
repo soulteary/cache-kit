@@ -13,8 +13,8 @@
 | ----- | ----- |
 | gofmt | 100% |
 | go_vet | 100% |
-| gocyclo | 94% |
 | ineffassign | 100% |
+| gocyclo | 94% |
 | license | 100% |
 | misspell | 100% |
 
