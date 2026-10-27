@@ -88,6 +88,5 @@ func isNil(client redis.UniversalClient) bool {
 	if client == nil {
 		return true
 	}
-	v := reflect.ValueOf(client)
-	return v.Kind() == reflect.Ptr && v.IsNil()
+	return reflect.ValueOf(client).IsNil()
 }
