@@ -10,6 +10,21 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+### Added
+
+- `ttlcache`, a stdlib-only generic key/value cache with a TTL per key. It
+  supports lazy and periodic expiry, LRU eviction, entry and cost limits,
+  cumulative statistics, eviction callbacks, and a controllable test clock.
+- `ttlcache/loader`, with same-key request coalescing, short-lived error
+  caching, TTL jitter, bounded background refresh, and stale-while-revalidate.
+- `ttlcache/hybrid`, an explicit cache-aside L1/L2 composition that refills L1
+  with the remaining L2 TTL and reports partial writes.
+- `ttlcache/redisadapter`, which implements the hybrid L2 contract with
+  `redis-kit/cache`.
+
+The root package and the in-memory TTL packages remain stdlib-only. Redis is
+linked only by programs that import `rediscache` or `ttlcache/redisadapter`.
+
 ## [2.0.0] — 2026-09-21
 
 Two breaking changes, released together. Each one on its own would force every

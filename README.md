@@ -4,30 +4,33 @@
 
 [中文文档](README_CN.md)
 
-A Go library for thread-safe, multi-index memory caching with Redis support.
-Look values up by any number of keys in O(1), detect content changes by a
-reproducible hash, and share the cache across instances through Redis.
+A Go cache library with two independent in-memory designs: a multi-index
+collection cache and a per-key TTL cache. Redis support is available in
+separate subpackages.
 
-The root package depends on nothing outside the standard library. Redis lives
-in the `rediscache` subpackage, so a program that only caches in memory never
-links go-redis: 95 packages instead of 199, and a 3.99 MB binary instead of
-6.99 MB. See [Dependency footprint](#dependency-footprint).
+The root package and `ttlcache` use only the standard library. Redis code is
+linked only when a program imports `rediscache` or `ttlcache/redisadapter`.
+See [Dependency footprint](#dependency-footprint).
 
 ## Features
 
 - **Multi-index lookup**: O(1) lookups by several keys (ID, email, phone, …)
 - **Thread-safe**: safe for concurrent readers and writers
 - **Reproducible change detection**: a content hash that is stable across processes
-- **Redis support**: a Redis adapter in `./rediscache`, imported only if you use it
-- **Hybrid cache**: memory in front of Redis
-- **Stdlib-only root package**: Redis costs you nothing until you import it
+- **Redis support**: collection and TTL adapters live in separate subpackages
+- **Hybrid cache**: explicit L1/L2 composition for both cache designs
+- **Stdlib-only memory packages**: the root package and `./ttlcache` do not link Redis
 - **Generic**: works with any value type through Go generics
-- **Fluent configuration**: builder pattern for both configs
+- **Fluent collection configuration**: builder methods for memory and Redis collection caches
+- **Per-key TTL cache**: independent expiration, LRU/cost limits, statistics and a test clock in `./ttlcache`
+- **Request coalescing**: optional stale-while-revalidate loading in `./ttlcache/loader`
+- **Redis-backed TTL KV**: optional `redis-kit` adapter and explicit cache-aside hybrid composition
 
 ## Requirements
 
-- **Go 1.27.2+** (`go.mod` declares `go 1.27.2`)
-- `github.com/redis/go-redis/v9` **only if** you import `./rediscache`; the root package needs nothing
+- **Go 1.27.3+** (`go.mod` declares `go 1.27.3`)
+- `github.com/redis/go-redis/v9` when importing `./rediscache` or `./ttlcache/redisadapter`
+- `github.com/soulteary/redis-kit` when importing `./ttlcache/redisadapter`
 - Redis with `EVAL` support (any 2.6+) when `MaxValueBytes` is set
 
 
@@ -86,6 +89,55 @@ func main() {
     fmt.Println("cache hash:", c.GetHash())
 }
 ```
+
+### Per-key TTL cache
+
+The TTL cache is separate from the collection-oriented multi-index cache. Each
+key has its own lifetime; expired values are never returned, even when the
+background cleanup interval has not elapsed.
+
+```go
+import (
+    "time"
+    "github.com/soulteary/cache-kit/v2/ttlcache"
+)
+
+pages := ttlcache.New(ttlcache.Config[string, []byte]{
+    DefaultTTL:      10 * time.Minute,
+    CleanupInterval: time.Minute,
+    MaxEntries:      1_000,
+    MaxCost:         64 << 20,
+    Cost: func(_ string, body []byte) int64 { return int64(len(body)) },
+})
+defer func() { _ = pages.Close() }()
+
+_ = pages.Set("https://example.com/article", html, 5*time.Minute)
+body, ok := pages.Get("https://example.com/article")
+stats := pages.Stats()
+_, _, _ = body, ok, stats
+```
+
+The TTL argument to `Set` applies to that key. Pass `0` to use `DefaultTTL`, or
+`ttlcache.NoExpiration` to keep the value until deletion or eviction. Reads
+remove expired entries synchronously, so `CleanupInterval` controls memory
+reclamation rather than correctness. Set it to zero to disable the cleanup
+goroutine.
+
+Capacity is optional. `MaxEntries` limits the number of keys; `MaxCost` and
+`MaxItemCost` use the value returned by `Cost`. When a limit is exceeded, the
+least recently used entries are removed. Eviction callbacks run after the
+cache lock is released and may safely call the cache again.
+
+Optional packages add loading and storage policy without changing the core:
+
+- `ttlcache/loader`: same-key request coalescing, negative caching, TTL jitter,
+  and stale-while-revalidate.
+- `ttlcache/redisadapter`: adapts `redis-kit/cache` to the TTL store contract.
+- `ttlcache/hybrid`: explicit cache-aside L1/L2 composition. An L2 hit is
+  inserted into L1 using the remaining L2 TTL, never a fresh full TTL.
+
+This is a generic expiring key/value cache, not an implementation of HTTP cache
+semantics such as `Vary`, validators, revalidation, or `Cache-Control`.
 
 ### Redis cache
 
@@ -354,8 +406,13 @@ transaction, and Redis refuses a `MULTI` that spans slots.
 
 ## Dependency footprint
 
-Redis lives in `./rediscache`, so it is linked only by programs that import it.
-Measured for a program that imports the root package and nothing else, v1.7.0
+Redis integrations live in `./rediscache` and `./ttlcache/redisadapter`. The
+root package, `./ttlcache`, `./ttlcache/loader`, and `./ttlcache/hybrid` do not
+import go-redis or redis-kit.
+
+The following historical measurement compares a program that imports only the
+root package in v1.7.0 and v2.0.0. The new TTL packages do not change these
+numbers because they are not imported by that program. Measured v1.7.0
 against v2.0.0 (`go build -trimpath`, Go 1.27.0, linux/amd64):
 
 | | v1.7.0 | v2.0.0 |
@@ -367,15 +424,15 @@ against v2.0.0 (`go build -trimpath`, Go 1.27.0, linux/amd64):
 | Consumer `go.sum` modules | 14 | 1 |
 
 The `go.sum` line is module graph pruning at work: a requirement that no
-imported package needs stays out of your checksums entirely. Importing
-`./rediscache` brings go-redis, `cespare/xxhash`, `go.uber.org/atomic` and
-`golang.org/x/sys` back — that is the price of the feature, paid by the
-programs that use it.
+imported package needs stays out of the consumer's checksums. Importing
+`./rediscache` or `./ttlcache/redisadapter` brings Redis dependencies into the
+build. The repository's `go.mod` still declares them, so tools that inspect the
+complete module graph can see them even when the final binary does not link
+them.
 
 One thing pruning does **not** do is insulate you from minimal version
-selection. If your program uses go-redis itself, this module's requirement
-still raises it: a program pinning `v9.7.0` and depending on cache-kit v2
-resolves to `v9.22.0`.
+selection. If a program uses go-redis or redis-kit itself, cache-kit's version
+requirements can affect the selected versions.
 
 ## API Reference
 
@@ -405,6 +462,63 @@ c.Iterate(func(v V) bool)
 // Change detection
 c.GetHash() string
 ```
+
+### ttlcache.Memory
+
+```go
+c := ttlcache.New[K, V](config)
+
+c.Set(key, value, ttl) error // ttl == 0 uses DefaultTTL
+c.Get(key) (V, bool)
+c.Delete(key) bool
+c.Expire(key, ttl) bool
+c.TTL(key) (time.Duration, bool)
+c.Len() int
+c.Clear()
+c.Stats() ttlcache.Stats
+c.Close() error
+```
+
+`Stats` counters are cumulative. `Entries` and `Cost` describe the cache at
+the time of the call. Use `ManualClock` in tests to exercise expiry without
+sleeping.
+
+### ttlcache/loader
+
+```go
+l := loader.New[string, Page](loader.Config{MaxEntries: 1_000, MaxRefresh: 8})
+defer func() { _ = l.Close() }()
+
+result, err := l.GetOrLoad(ctx, url, fetchPage, loader.Policy{
+    FreshTTL:  5 * time.Minute,
+    StaleTTL:  30 * time.Minute,
+    ErrorTTL:  10 * time.Second,
+    TTLJitter: 0.1,
+})
+```
+
+Concurrent misses for one key share a load. After `FreshTTL`, a cached value is
+returned with `result.Stale == true` while one background refresh runs. The
+entry is removed after the additional `StaleTTL`. `ErrorTTL` briefly caches a
+foreground load error; it does not replace an existing stale value.
+
+### ttlcache/hybrid and redisadapter
+
+```go
+l1 := ttlcache.New(ttlcache.DefaultConfig[string, Page]())
+l2 := redisadapter.New[string, Page](redisClient, "pages:", nil)
+c := hybrid.New(l1, l2, hybrid.RedisFirst)
+
+page, ok, err := c.Get(ctx, url)
+err = c.Set(ctx, url, page, 10*time.Minute)
+err = c.Delete(ctx, url)
+```
+
+`RedisFirst` is the default and attempts to remove L2 if the L1 write fails.
+`MemoryFirst` avoids an L2 write when L1 rejects the value, but an L2 failure
+can leave the new value in L1. In either case, inspect `*hybrid.PartialError`
+when the layers may differ. Closing the hybrid cache stops L1 only; the caller
+owns the Redis client.
 
 ### rediscache.Cache
 
