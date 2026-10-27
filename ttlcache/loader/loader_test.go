@@ -64,7 +64,11 @@ func TestWaiterCancellation(t *testing.T) {
 	l := New[string, int](Config{})
 	defer func() { _ = l.Close() }()
 	block := make(chan struct{})
-	go l.GetOrLoad(context.Background(), "x", func(context.Context, string) (int, error) { <-block; return 1, nil }, Policy{FreshTTL: time.Minute})
+	loadErr := make(chan error, 1)
+	go func() {
+		_, err := l.GetOrLoad(context.Background(), "x", func(context.Context, string) (int, error) { <-block; return 1, nil }, Policy{FreshTTL: time.Minute})
+		loadErr <- err
+	}()
 	time.Sleep(time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -73,6 +77,9 @@ func TestWaiterCancellation(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 	close(block)
+	if err := <-loadErr; err != nil {
+		t.Fatalf("load err=%v", err)
+	}
 }
 
 func TestCloseCancelsBackgroundRefresh(t *testing.T) {
