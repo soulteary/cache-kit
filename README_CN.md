@@ -4,11 +4,11 @@
 
 [English](README.md)
 
-线程安全的多索引内存缓存库，支持 Redis。可以用任意多个键做 O(1) 查找，用可复现的
-哈希做内容变更检测，并通过 Redis 在多实例间共享缓存。
+cache-kit 提供两套互不依赖的内存缓存：根包用于多索引集合，`ttlcache` 用于每个键独立
+过期的 KV。需要跨实例共享数据时，再按需导入 Redis 子包。
 
-根包只依赖标准库。Redis 放在 `rediscache` 子包里，所以只用内存缓存的程序根本不会
-链接 go-redis：链接包数 95 而不是 199，二进制 3.99 MB 而不是 6.99 MB。详见
+根包和 `ttlcache` 都只使用标准库。只有导入 `rediscache` 或
+`ttlcache/redisadapter` 时，Redis 相关代码才会进入最终程序。具体差异见
 [依赖体积](#依赖体积)。
 
 ## 特性
@@ -16,16 +16,19 @@
 - **多索引查找**：按多个键（ID、邮箱、手机号……）做 O(1) 查找
 - **线程安全**：并发读写安全
 - **可复现的变更检测**：跨进程稳定的内容哈希
-- **Redis 支持**：`./rediscache` 子包里的 Redis 适配器，用到才导入
-- **混合缓存**：内存在前，Redis 在后
-- **根包零第三方依赖**：不导入 `rediscache`，Redis 就一分钱不花
+- **Redis 支持**：集合缓存和 TTL 缓存的 Redis 适配器分别放在独立子包中
+- **混合缓存**：两套缓存都可以组合 L1 内存与 L2 Redis
+- **内存包只用标准库**：根包和 `./ttlcache` 都不会链接 Redis
 - **泛型**：基于 Go 泛型，适用于任意值类型
-- **链式配置**：两套配置都支持构造器风格
+- **集合缓存配置**：内存与 Redis 集合缓存都提供链式配置方法
+- **单键 TTL**：每个键独立过期，支持 LRU、容量限制、统计和测试时钟
+- **请求合并**：可选的同键请求合并与 stale-while-revalidate
 
 ## 要求
 
-- **Go 1.27.2+**（`go.mod` 声明 `go 1.27.2`）
-- **仅当**导入 `./rediscache` 时才需要 `github.com/redis/go-redis/v9`；根包什么都不需要
+- **Go 1.27.3+**（`go.mod` 声明 `go 1.27.3`）
+- 导入 `./rediscache` 或 `./ttlcache/redisadapter` 时需要 `github.com/redis/go-redis/v9`
+- 导入 `./ttlcache/redisadapter` 时还会使用 `github.com/soulteary/redis-kit`
 - 设置了 `MaxValueBytes` 时，Redis 需支持 `EVAL`（2.6+ 均可）
 
 
@@ -84,6 +87,42 @@ func main() {
     fmt.Println("缓存哈希:", c.GetHash())
 }
 ```
+
+### 单键独立 TTL 缓存
+
+`ttlcache` 与现有的多索引集合缓存相互独立。每个键拥有自己的过期时间；即使后台清理尚未运行，读取也不会返回已过期值。
+
+```go
+pages := ttlcache.New(ttlcache.Config[string, []byte]{
+    DefaultTTL:      10 * time.Minute,
+    CleanupInterval: time.Minute,
+    MaxEntries:      1_000,
+    MaxCost:         64 << 20,
+    Cost: func(_ string, body []byte) int64 { return int64(len(body)) },
+})
+defer func() { _ = pages.Close() }()
+
+_ = pages.Set("https://example.com/article", html, 5*time.Minute)
+body, ok := pages.Get("https://example.com/article")
+```
+
+`Set` 的 TTL 只作用于当前键。传入 `0` 时使用 `DefaultTTL`，传入
+`ttlcache.NoExpiration` 时持续保留，直到主动删除或被容量策略淘汰。读取时会立即判断
+是否过期，因此 `CleanupInterval` 只影响过期数据何时从内存中清走，不影响读取结果；设为
+`0` 可以关闭后台清理。
+
+容量限制也是可选的。`MaxEntries` 限制键数量，`MaxCost` 和 `MaxItemCost` 使用 `Cost`
+返回的成本。超过限制后按 LRU 淘汰。`OnEvict` 在缓存锁释放后执行，回调里可以再次调用
+缓存。
+
+下面三个子包负责加载和存储策略：
+
+- `ttlcache/loader`：同键请求合并、错误短缓存、TTL 抖动和 stale-while-revalidate。
+- `ttlcache/redisadapter`：将 `redis-kit/cache` 适配为 TTL Store。
+- `ttlcache/hybrid`：显式的 L1/L2 cache-aside 组合；L2 命中按剩余 TTL 回填 L1。
+
+它是通用的过期 KV，不处理 `Vary`、ETag、条件请求或 `Cache-Control`。如果用它缓存
+网页，这些 HTTP 语义仍需由上层负责。
 
 ### Redis 缓存
 
@@ -336,8 +375,12 @@ hash tag（`KeyPrefix` 写 `"{users}:"` 而不是 `"users:"`）：`Set`、`SetWi
 
 ## 依赖体积
 
-Redis 放在 `./rediscache` 里，只有导入它的程序才会链接。以一个只导入根包的程序为准，
-v1.7.0 与 v2.0.0 的实测对比（`go build -trimpath`，Go 1.27.0，linux/amd64）：
+Redis 相关实现放在 `./rediscache` 和 `./ttlcache/redisadapter`。根包、`./ttlcache`、
+`./ttlcache/loader` 与 `./ttlcache/hybrid` 都不会导入 go-redis 或 redis-kit。
+
+下面是 v1.7.0 和 v2.0.0 的历史实测，测试程序只导入根包。新增 TTL 子包不会改变这组
+数据，因为测试程序没有导入它们。测试命令为 `go build -trimpath`，环境是 Go 1.27.0、
+linux/amd64：
 
 | | v1.7.0 | v2.0.0 |
 |---|---|---|
@@ -347,14 +390,13 @@ v1.7.0 与 v2.0.0 的实测对比（`go build -trimpath`，Go 1.27.0，linux/amd
 | 使用方 `go.mod` 的 indirect 条目 | 4 | 0 |
 | 使用方 `go.sum` 的模块数 | 14 | 1 |
 
-`go.sum` 这一行是 module graph pruning 的效果：没有任何被导入的包需要的依赖，根本
-不会进入你的校验和文件。导入 `./rediscache` 会把 go-redis、`cespare/xxhash`、
-`go.uber.org/atomic` 和 `golang.org/x/sys` 带回来——这是这个功能的成本，由真正用到
-它的程序来付。
+`go.sum` 这一行体现了 module graph pruning：没有被导入包使用的依赖，不会进入使用方
+的校验和文件。导入 `./rediscache` 或 `./ttlcache/redisadapter` 后，Redis 依赖才会参与
+构建。不过，cache-kit 自己的 `go.mod` 仍然声明了这些依赖，因此检查完整模块图的工具
+依然能看到它们。
 
-有一点 pruning 管不了：MVS（最小版本选择）。如果你的程序自己也用 go-redis，本模块的
-依赖声明仍然会把它顶上去——一个锁定 `v9.7.0` 又依赖 cache-kit v2 的程序，最终解析到
-`v9.22.0`。
+MVS（最小版本选择）不受包级链接隔离影响。如果使用方自己也依赖 go-redis 或
+redis-kit，cache-kit 声明的版本可能影响最终选择结果。
 
 ## API 参考
 
@@ -384,6 +426,60 @@ c.Iterate(func(v V) bool)
 // 变更检测
 c.GetHash() string
 ```
+
+### ttlcache.Memory
+
+```go
+c := ttlcache.New[K, V](config)
+
+c.Set(key, value, ttl) error // ttl 为 0 时使用 DefaultTTL
+c.Get(key) (V, bool)
+c.Delete(key) bool
+c.Expire(key, ttl) bool
+c.TTL(key) (time.Duration, bool)
+c.Len() int
+c.Clear()
+c.Stats() ttlcache.Stats
+c.Close() error
+```
+
+`Stats` 中的计数器从缓存创建后开始累计，`Entries` 和 `Cost` 表示调用时的状态。测试
+过期逻辑时可以使用 `ManualClock`，不需要依赖 `time.Sleep`。
+
+### ttlcache/loader
+
+```go
+l := loader.New[string, Page](loader.Config{MaxEntries: 1_000, MaxRefresh: 8})
+defer func() { _ = l.Close() }()
+
+result, err := l.GetOrLoad(ctx, url, fetchPage, loader.Policy{
+    FreshTTL:  5 * time.Minute,
+    StaleTTL:  30 * time.Minute,
+    ErrorTTL:  10 * time.Second,
+    TTLJitter: 0.1,
+})
+```
+
+同一个键并发未命中时，只会执行一次加载。超过 `FreshTTL` 后，调用会立即返回旧值并将
+`result.Stale` 设为 `true`，同时在后台刷新；再经过 `StaleTTL` 后，旧值才会过期。
+`ErrorTTL` 只短暂缓存前台加载错误，不会覆盖仍可使用的旧值。
+
+### ttlcache/hybrid 与 redisadapter
+
+```go
+l1 := ttlcache.New(ttlcache.DefaultConfig[string, Page]())
+l2 := redisadapter.New[string, Page](redisClient, "pages:", nil)
+c := hybrid.New(l1, l2, hybrid.RedisFirst)
+
+page, ok, err := c.Get(ctx, url)
+err = c.Set(ctx, url, page, 10*time.Minute)
+err = c.Delete(ctx, url)
+```
+
+默认的 `RedisFirst` 先写 L2；如果 L1 拒绝写入，会尝试删除刚写入的 L2 数据。
+`MemoryFirst` 可以在 L1 拒绝数据时避免写 Redis，但 L2 写入失败后，新值仍可能留在 L1。
+遇到 `*hybrid.PartialError` 时，应按业务需要处理两层不一致。关闭 Hybrid 只会停止 L1，
+Redis 客户端仍由调用方管理。
 
 ### rediscache.Cache
 

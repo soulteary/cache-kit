@@ -19,17 +19,20 @@
 //
 // # Layout
 //
-// This package depends on nothing outside the standard library. Redis support
-// lives in the [github.com/soulteary/cache-kit/v2/rediscache] subpackage, so a
-// program that only caches in memory does not link go-redis -- nor
-// cespare/xxhash, go.uber.org/atomic and golang.org/x/sys, which come with it.
-// Importing rediscache is what pulls them in:
+// This package depends on nothing outside the standard library. The independent
+// [github.com/soulteary/cache-kit/v2/ttlcache] package is also stdlib-only.
+// Redis integrations live in
+// [github.com/soulteary/cache-kit/v2/rediscache] and
+// [github.com/soulteary/cache-kit/v2/ttlcache/redisadapter], so programs that
+// only use the in-memory packages do not link go-redis or redis-kit.
+// Importing a Redis subpackage is what pulls those dependencies in:
 //
 //	import "github.com/soulteary/cache-kit/v2/rediscache"
 //
 //	c := rediscache.New[User](client, rediscache.DefaultConfig())
 //	hybrid := rediscache.NewHybrid[User](config, client, rediscache.DefaultConfig())
 //
-// Module graph pruning keeps that split honest: a requirement no imported
-// package needs stays out of the consumer's go.mod and go.sum entirely.
+// Go's package linker preserves this split. The module's go.mod still declares
+// the Redis dependencies, so they remain visible to module graph inspection
+// and can participate in minimal version selection.
 package cache
