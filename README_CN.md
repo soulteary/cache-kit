@@ -462,7 +462,8 @@ result, err := l.GetOrLoad(ctx, url, fetchPage, loader.Policy{
 
 同一个键并发未命中时，只会执行一次加载。超过 `FreshTTL` 后，调用会立即返回旧值并将
 `result.Stale` 设为 `true`，同时在后台刷新；再经过 `StaleTTL` 后，旧值才会过期。
-`ErrorTTL` 只短暂缓存前台加载错误，不会覆盖仍可使用的旧值。
+`ErrorTTL` 只短暂缓存前台加载错误，不会覆盖仍可使用的旧值。调用方的 context 取消后，
+当前调用不再等待；共享加载仍可供其他调用使用，并在 Loader 关闭时取消。
 
 ### ttlcache/hybrid 与 redisadapter
 
@@ -479,7 +480,7 @@ err = c.Delete(ctx, url)
 默认的 `RedisFirst` 先写 L2；如果 L1 拒绝写入，会尝试删除刚写入的 L2 数据。
 `MemoryFirst` 可以在 L1 拒绝数据时避免写 Redis，但 L2 写入失败后，新值仍可能留在 L1。
 遇到 `*hybrid.PartialError` 时，应按业务需要处理两层不一致。关闭 Hybrid 只会停止 L1，
-Redis 客户端仍由调用方管理。
+Redis 客户端仍由调用方管理。Redis Adapter 会原子读取值及其剩余 TTL，再回填 L1。
 
 ### rediscache.Cache
 

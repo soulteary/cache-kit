@@ -500,7 +500,9 @@ result, err := l.GetOrLoad(ctx, url, fetchPage, loader.Policy{
 Concurrent misses for one key share a load. After `FreshTTL`, a cached value is
 returned with `result.Stale == true` while one background refresh runs. The
 entry is removed after the additional `StaleTTL`. `ErrorTTL` briefly caches a
-foreground load error; it does not replace an existing stale value.
+foreground load error; it does not replace an existing stale value. Cancelling
+a caller's context stops that caller from waiting, but the shared load remains
+available to other callers and is cancelled when the loader closes.
 
 ### ttlcache/hybrid and redisadapter
 
@@ -518,7 +520,8 @@ err = c.Delete(ctx, url)
 `MemoryFirst` avoids an L2 write when L1 rejects the value, but an L2 failure
 can leave the new value in L1. In either case, inspect `*hybrid.PartialError`
 when the layers may differ. Closing the hybrid cache stops L1 only; the caller
-owns the Redis client.
+owns the Redis client. The Redis adapter reads each value and its remaining TTL
+atomically before refilling L1.
 
 ### rediscache.Cache
 

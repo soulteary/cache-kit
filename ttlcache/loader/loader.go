@@ -107,20 +107,51 @@ func (l *Loader[K, V]) load(ctx context.Context, key K, fn func(context.Context,
 	}
 	if existing := l.flights[key]; existing != nil {
 		l.mu.Unlock()
-		select {
-		case <-existing.done:
-			return Result[V]{Value: existing.value, Shared: true}, existing.err
-		case <-ctx.Done():
-			var z Result[V]
-			return z, ctx.Err()
+		return wait(ctx, existing, true)
+	}
+	// The first cache lookup happens before taking l.mu. A previous flight may
+	// have populated the cache and removed itself while this caller waited for
+	// the mutex, so check again before registering another backend request.
+	if !background {
+		if cached, ok := l.cache.Get(key); ok {
+			if cached.err != nil {
+				l.mu.Unlock()
+				var zero Result[V]
+				return zero, cached.err
+			}
+			if l.clock.Now().Before(cached.freshUntil) {
+				l.mu.Unlock()
+				return Result[V]{Value: cached.value}, nil
+			}
+			if p.StaleTTL > 0 {
+				l.mu.Unlock()
+				l.refreshAsync(key, fn, p)
+				return Result[V]{Value: cached.value, Stale: true}, nil
+			}
 		}
 	}
 	c := &call[V]{done: make(chan struct{})}
 	l.flights[key] = c
+	l.wg.Add(1)
+	go l.execute(l.ctx, key, fn, p, background, c, nil)
 	l.mu.Unlock()
-	loadCtx := context.WithoutCancel(ctx)
-	if background {
-		loadCtx = ctx
+	return wait(ctx, c, false)
+}
+
+func wait[V any](ctx context.Context, c *call[V], shared bool) (Result[V], error) {
+	select {
+	case <-c.done:
+		return Result[V]{Value: c.value, Shared: shared}, c.err
+	case <-ctx.Done():
+		var zero Result[V]
+		return zero, ctx.Err()
+	}
+}
+
+func (l *Loader[K, V]) execute(ctx context.Context, key K, fn func(context.Context, K) (V, error), p Policy, background bool, c *call[V], release func()) {
+	defer l.wg.Done()
+	if release != nil {
+		defer release()
 	}
 	func() {
 		defer func() {
@@ -128,7 +159,7 @@ func (l *Loader[K, V]) load(ctx context.Context, key K, fn func(context.Context,
 				c.err = fmt.Errorf("loader panic: %v", r)
 			}
 		}()
-		c.value, c.err = fn(loadCtx, key)
+		c.value, c.err = fn(ctx, key)
 	}()
 	now := l.clock.Now()
 	if c.err == nil {
@@ -142,7 +173,6 @@ func (l *Loader[K, V]) load(ctx context.Context, key K, fn func(context.Context,
 	delete(l.flights, key)
 	close(c.done)
 	l.mu.Unlock()
-	return Result[V]{Value: c.value}, c.err
 }
 
 func (l *Loader[K, V]) refreshAsync(key K, fn func(context.Context, K) (V, error), p Policy) {
@@ -153,13 +183,11 @@ func (l *Loader[K, V]) refreshAsync(key K, fn func(context.Context, K) (V, error
 	}
 	select {
 	case l.refresh <- struct{}{}:
+		c := &call[V]{done: make(chan struct{})}
+		l.flights[key] = c
 		l.wg.Add(1)
+		go l.execute(l.ctx, key, fn, p, true, c, func() { <-l.refresh })
 		l.mu.Unlock()
-		go func() {
-			defer l.wg.Done()
-			defer func() { <-l.refresh }()
-			_, _ = l.load(l.ctx, key, fn, p, true)
-		}()
 	default:
 		l.mu.Unlock()
 	}
