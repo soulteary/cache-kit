@@ -25,6 +25,21 @@ also changes the module path. The current one is
 The root package and the in-memory TTL packages remain stdlib-only. Redis is
 linked only by programs that import `rediscache` or `ttlcache/redisadapter`.
 
+### Fixed
+
+- Delayed same-key misses now recheck the cache before starting a load, so a
+  completed flight cannot be followed by redundant backend requests.
+- Every caller, including the one that starts a shared load, can stop waiting
+  when its context is cancelled. The shared load continues for other callers
+  until it completes or the loader closes, while retaining the initiating
+  caller's context values.
+- An expiry callback triggered by periodic cleanup can call `Close` without
+  making the cleanup goroutine wait for itself.
+- `ttlcache/redisadapter` reads a value and its remaining TTL in one Redis Lua
+  script, so L1 cannot receive an old value with a newer value's lifetime.
+
+The full test suite now enforces at least 80% statement coverage.
+
 ## [2.0.0] — 2026-09-21
 
 Two breaking changes, released together. Each one on its own would force every

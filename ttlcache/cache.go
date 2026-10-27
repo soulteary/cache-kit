@@ -248,7 +248,7 @@ func (c *Memory[K, V]) TTL(key K) (time.Duration, bool) {
 
 // Len returns the number of live entries after removing expired entries.
 func (c *Memory[K, V]) Len() int {
-	c.cleanupExpired()
+	c.notify(c.cleanupExpired()...)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.items)
@@ -274,7 +274,7 @@ func (c *Memory[K, V]) Clear() {
 
 // Stats returns cumulative counters and the current entry count and cost.
 func (c *Memory[K, V]) Stats() Stats {
-	c.cleanupExpired()
+	c.notify(c.cleanupExpired()...)
 	c.mu.Lock()
 	entries, cost := len(c.items), c.cost
 	c.mu.Unlock()
@@ -323,19 +323,24 @@ func (c *Memory[K, V]) cleanupLoop() {
 	for {
 		select {
 		case <-t.C:
-			c.cleanupExpired()
+			// Dispatch outside the cleanup goroutine. In particular, an eviction
+			// callback may call Close without waiting for this goroutine from itself.
+			events := c.cleanupExpired()
+			if len(events) > 0 {
+				go c.notify(events...)
+			}
 		case <-c.stop:
 			return
 		}
 	}
 }
-func (c *Memory[K, V]) cleanupExpired() {
+func (c *Memory[K, V]) cleanupExpired() []eviction[K, V] {
 	now := c.cfg.Clock.Now()
 	var events []eviction[K, V]
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return
+		return nil
 	}
 	for _, e := range c.items {
 		if c.expired(e, now) {
@@ -344,5 +349,5 @@ func (c *Memory[K, V]) cleanupExpired() {
 		}
 	}
 	c.mu.Unlock()
-	c.notify(events...)
+	return events
 }

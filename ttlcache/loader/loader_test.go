@@ -2,6 +2,8 @@ package loader
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -107,5 +109,166 @@ func TestCloseCancelsBackgroundRefresh(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("Close did not cancel refresh")
+	}
+}
+
+func TestDelayedMissRechecksCacheBeforeLoading(t *testing.T) {
+	l := New[string, int](Config{})
+	defer func() { _ = l.Close() }()
+	l.mu.Lock()
+	const callers = 50
+	results := make(chan error, callers)
+	var loads atomic.Int32
+	for i := 0; i < callers; i++ {
+		go func() {
+			result, err := l.GetOrLoad(context.Background(), "x", func(context.Context, string) (int, error) {
+				loads.Add(1)
+				return 2, nil
+			}, Policy{FreshTTL: time.Hour})
+			if err == nil && result.Value != 1 {
+				err = errors.New("unexpected value")
+			}
+			results <- err
+		}()
+	}
+	deadline := time.Now().Add(time.Second)
+	for l.cache.Stats().Misses < callers && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if misses := l.cache.Stats().Misses; misses != callers {
+		l.mu.Unlock()
+		t.Fatalf("initial misses = %d", misses)
+	}
+	if err := l.cache.Set("x", stored[int]{value: 1, freshUntil: time.Now().Add(time.Hour)}, time.Hour); err != nil {
+		l.mu.Unlock()
+		t.Fatal(err)
+	}
+	l.mu.Unlock()
+	for i := 0; i < callers; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if loads.Load() != 0 {
+		t.Fatalf("backend loads = %d", loads.Load())
+	}
+}
+
+func TestInitiatingCallerCanCancelWait(t *testing.T) {
+	l := New[string, int](Config{})
+	defer func() { _ = l.Close() }()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := l.GetOrLoad(ctx, "x", func(context.Context, string) (int, error) {
+			close(started)
+			<-release
+			return 7, nil
+		}, Policy{FreshTTL: time.Minute})
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("GetOrLoad error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initiating caller did not observe cancellation")
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for {
+		result, err := l.GetOrLoad(context.Background(), "x", func(context.Context, string) (int, error) { return 8, nil }, Policy{FreshTTL: time.Minute})
+		if err == nil && result.Value == 7 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("shared load was not cached: result=%+v err=%v", result, err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestForegroundLoadPreservesValuesAndClosesWithLoader(t *testing.T) {
+	type contextKey struct{}
+	l := New[string, string](Config{})
+	valueSeen := make(chan string, 1)
+	result := make(chan error, 1)
+	ctx := context.WithValue(context.Background(), contextKey{}, "credential")
+	go func() {
+		_, err := l.GetOrLoad(ctx, "x", func(loadCtx context.Context, _ string) (string, error) {
+			valueSeen <- loadCtx.Value(contextKey{}).(string)
+			<-loadCtx.Done()
+			return "", loadCtx.Err()
+		}, Policy{FreshTTL: time.Minute})
+		result <- err
+	}()
+	if got := <-valueSeen; got != "credential" {
+		t.Fatalf("context value = %q", got)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("load error = %v", err)
+	}
+}
+
+func TestPolicyErrorsPanicAndErrorCaching(t *testing.T) {
+	l := New[string, int](Config{})
+	defer func() { _ = l.Close() }()
+	if _, err := l.GetOrLoad(context.Background(), "bad", nil, Policy{}); err == nil {
+		t.Fatal("zero FreshTTL accepted")
+	}
+
+	var calls atomic.Int32
+	want := errors.New("load failed")
+	load := func(context.Context, string) (int, error) {
+		calls.Add(1)
+		return 0, want
+	}
+	p := Policy{FreshTTL: time.Minute, ErrorTTL: time.Minute}
+	for i := 0; i < 2; i++ {
+		if _, err := l.GetOrLoad(context.Background(), "error", load, p); !errors.Is(err, want) {
+			t.Fatalf("cached error = %v", err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("error loads = %d", calls.Load())
+	}
+
+	_, err := l.GetOrLoad(context.Background(), "panic", func(context.Context, string) (int, error) {
+		panic("boom")
+	}, Policy{FreshTTL: time.Minute})
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("panic error = %v", err)
+	}
+}
+
+func TestJitterBounds(t *testing.T) {
+	if got := jitter(time.Minute, 0); got != time.Minute {
+		t.Fatalf("zero jitter = %v", got)
+	}
+	for _, fraction := range []float64{0.5, 2} {
+		for i := 0; i < 100; i++ {
+			got := jitter(time.Minute, fraction)
+			if got < 0 || got > 2*time.Minute {
+				t.Fatalf("jitter(%v) = %v", fraction, got)
+			}
+		}
+	}
+}
+
+func TestGetAfterClose(t *testing.T) {
+	l := New[string, int](Config{})
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.GetOrLoad(context.Background(), "x", func(context.Context, string) (int, error) { return 1, nil }, Policy{FreshTTL: time.Minute}); !errors.Is(err, ttlcache.ErrClosed) {
+		t.Fatalf("GetOrLoad error = %v", err)
 	}
 }

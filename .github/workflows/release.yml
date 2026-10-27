@@ -150,7 +150,7 @@ jobs:
         packages: ./...
         race: 'true'
         cover_mode: atomic
-        coverage_threshold: '0'
+        coverage_threshold: '80'
         test_args: -v
         version: ${{ runner.os == 'macOS' && 'source' || 'v1.1.2' }}
         commit: 'false'
