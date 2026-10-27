@@ -10,6 +10,8 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-10-28
+
 ### Added
 
 - `ttlcache`, a stdlib-only generic key/value cache with a TTL per key. It
@@ -231,7 +233,8 @@ Redis value guard both behave differently.
 
 Predate this file; see the git history.
 
-[Unreleased]: https://github.com/soulteary/cache-kit/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/soulteary/cache-kit/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/soulteary/cache-kit/compare/v2.0.3...v2.1.0
 [2.0.0]: https://github.com/soulteary/cache-kit/compare/v1.7.0...v2.0.0
 [1.7.0]: https://github.com/soulteary/cache-kit/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/soulteary/cache-kit/compare/v1.5.0...v1.6.0
