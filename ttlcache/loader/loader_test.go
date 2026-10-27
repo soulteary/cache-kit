@@ -193,6 +193,31 @@ func TestInitiatingCallerCanCancelWait(t *testing.T) {
 	}
 }
 
+func TestForegroundLoadPreservesValuesAndClosesWithLoader(t *testing.T) {
+	type contextKey struct{}
+	l := New[string, string](Config{})
+	valueSeen := make(chan string, 1)
+	result := make(chan error, 1)
+	ctx := context.WithValue(context.Background(), contextKey{}, "credential")
+	go func() {
+		_, err := l.GetOrLoad(ctx, "x", func(loadCtx context.Context, _ string) (string, error) {
+			valueSeen <- loadCtx.Value(contextKey{}).(string)
+			<-loadCtx.Done()
+			return "", loadCtx.Err()
+		}, Policy{FreshTTL: time.Minute})
+		result <- err
+	}()
+	if got := <-valueSeen; got != "credential" {
+		t.Fatalf("context value = %q", got)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("load error = %v", err)
+	}
+}
+
 func TestPolicyErrorsPanicAndErrorCaching(t *testing.T) {
 	l := New[string, int](Config{})
 	defer func() { _ = l.Close() }()

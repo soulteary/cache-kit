@@ -463,7 +463,8 @@ result, err := l.GetOrLoad(ctx, url, fetchPage, loader.Policy{
 同一个键并发未命中时，只会执行一次加载。超过 `FreshTTL` 后，调用会立即返回旧值并将
 `result.Stale` 设为 `true`，同时在后台刷新；再经过 `StaleTTL` 后，旧值才会过期。
 `ErrorTTL` 只短暂缓存前台加载错误，不会覆盖仍可使用的旧值。调用方的 context 取消后，
-当前调用不再等待；共享加载仍可供其他调用使用，并在 Loader 关闭时取消。
+当前调用不再等待；共享加载仍可供其他调用使用，并在 Loader 关闭时取消。加载 context
+会保留发起者携带的 values。
 
 ### ttlcache/hybrid 与 redisadapter
 

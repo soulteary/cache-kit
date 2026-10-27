@@ -31,7 +31,8 @@ linked only by programs that import `rediscache` or `ttlcache/redisadapter`.
   completed flight cannot be followed by redundant backend requests.
 - Every caller, including the one that starts a shared load, can stop waiting
   when its context is cancelled. The shared load continues for other callers
-  until it completes or the loader closes.
+  until it completes or the loader closes, while retaining the initiating
+  caller's context values.
 - An expiry callback triggered by periodic cleanup can call `Close` without
   making the cleanup goroutine wait for itself.
 - `ttlcache/redisadapter` reads a value and its remaining TTL in one Redis Lua

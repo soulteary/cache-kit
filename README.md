@@ -502,7 +502,8 @@ returned with `result.Stale == true` while one background refresh runs. The
 entry is removed after the additional `StaleTTL`. `ErrorTTL` briefly caches a
 foreground load error; it does not replace an existing stale value. Cancelling
 a caller's context stops that caller from waiting, but the shared load remains
-available to other callers and is cancelled when the loader closes.
+available to other callers and is cancelled when the loader closes. The load
+context retains values from the caller that started it.
 
 ### ttlcache/hybrid and redisadapter
 

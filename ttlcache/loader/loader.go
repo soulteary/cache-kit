@@ -133,7 +133,20 @@ func (l *Loader[K, V]) load(ctx context.Context, key K, fn func(context.Context,
 	c := &call[V]{done: make(chan struct{})}
 	l.flights[key] = c
 	l.wg.Add(1)
-	go l.execute(l.ctx, key, fn, p, background, c, nil)
+	loadCtx := l.ctx
+	var release func()
+	if !background {
+		// Keep request-scoped values from the caller, but let the shared load
+		// outlive that caller and tie its cancellation to the Loader instead.
+		var cancel context.CancelFunc
+		loadCtx, cancel = context.WithCancel(context.WithoutCancel(ctx))
+		stop := context.AfterFunc(l.ctx, cancel)
+		release = func() {
+			stop()
+			cancel()
+		}
+	}
+	go l.execute(loadCtx, key, fn, p, background, c, release)
 	l.mu.Unlock()
 	return wait(ctx, c, false)
 }
