@@ -10,6 +10,25 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+## [2.1.1] — 2026-11-01
+
+### Changed
+
+- Raise the Redis adapter dependency floor to the published `redis-kit` v1.8.1.
+- Split deterministic hash encoding by reflected value kind without changing
+  its byte format, type tags, map ordering or time encoding.
+- Extract a shared TTL test assertion and align pinned report CLIs with their
+  released wrappers.
+
+### Quality
+
+- Resolve the reported complexity findings; the regenerated Go Report Card is
+  A+ (100%) with no affected files.
+- Verify the full suite with the race detector and preserve the stdlib-only
+  root and in-memory TTL packages.
+
+The public API and `/v2` module path remain unchanged.
+
 ## [2.1.0] — 2026-10-28
 
 ### Added
