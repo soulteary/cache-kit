@@ -7,9 +7,9 @@
     "skipped": 0
   },
   "coverage": {
-    "covered_statements": 766,
-    "total_statements": 858,
-    "percentage": 89.28,
+    "covered_statements": 770,
+    "total_statements": 862,
+    "percentage": 89.33,
     "threshold": 80
   },
   "packages": [
@@ -18,7 +18,7 @@
       "status": "pass",
       "tests": 56,
       "failed": 0,
-      "coverage": 85.67
+      "coverage": 85.86
     },
     {
       "name": "internal/hashtypes/alpha/foo",

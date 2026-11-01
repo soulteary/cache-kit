@@ -8,14 +8,14 @@
 | Passed | 120 |
 | Failed | 0 |
 | Skipped | 0 |
-| Coverage | 89.28% |
+| Coverage | 89.33% |
 | Threshold | 80.00% |
 
 ### Packages
 
 | Package | Status | Tests | Failed | Coverage |
 | --- | --- | --- | --- | --- |
-| . | pass | 56 | 0 | 85.67% |
+| . | pass | 56 | 0 | 85.86% |
 | internal/hashtypes/alpha/foo | no\_tests | 0 | 0 | N/A |
 | internal/hashtypes/beta/foo | no\_tests | 0 | 0 | N/A |
 | rediscache | pass | 37 | 0 | 91.48% |
