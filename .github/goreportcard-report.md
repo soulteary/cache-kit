@@ -1,11 +1,11 @@
 # Go Report Card
 
-**Grade: A+** (99.2%)
+**Grade: A+** (100.0%)
 
 | Metric | Value |
 | ------ | ----- |
 | Files | 28 |
-| Issues | 2 |
+| Issues | 0 |
 
 ## Checks
 
@@ -13,19 +13,12 @@
 | ----- | ----- |
 | gofmt | 100% |
 | go_vet | 100% |
-| gocyclo | 92% |
+| gocyclo | 100% |
 | ineffassign | 100% |
 | license | 100% |
 | misspell | 100% |
 
-## Issues
-
-### gocyclo
-
-- `config.go`
-  - Line 367: cyclomatic complexity 28 for function encodeForHash
-- `ttlcache/cache_test.go`
-  - Line 108: cyclomatic complexity 16 for function TestTTLExpireAndClear
+No issues found. Nice work!
 
 ---
 

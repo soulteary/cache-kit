@@ -372,116 +372,16 @@ func encodeForHash(sb *strings.Builder, v reflect.Value) {
 
 	switch v.Kind() {
 	case reflect.Pointer, reflect.Interface:
-		// Follow the pointer: its ADDRESS is not content.
-		if v.IsNil() {
-			sb.WriteString("nil;")
-			return
-		}
-		if v.Kind() == reflect.Interface {
-			// What the interface HOLDS is content. Following it blind made
-			// any(int(1)) and any(int64(1)) -- and any two struct types with
-			// the same exported shape -- encode identically, so swapping one
-			// for the other left GetHash() unchanged.
-			writeTypeTag(sb, v.Elem())
-		}
-		// addressable: an interface's dynamic value is never addressable, and
-		// a pointer's target always is, so this only costs a copy on the
-		// interface path -- where it is what keeps an embedded instant
-		// readable further down.
-		encodeForHash(sb, addressable(v.Elem()))
+		encodeIndirectForHash(sb, v)
 
 	case reflect.Struct:
-		if v.Type() == timeType {
-			// Wall clock only, and in UTC: the monotonic reading and the
-			// location pointer are not content.
-			// Seconds plus nanoseconds, never UnixNano: that is undefined
-			// outside 1678..2262, and it wraps modulo 2^64, so two instants
-			// 584.9 years apart encoded identically and the same instant
-			// could encode differently on another implementation. Unix() is
-			// valid across the whole range.
-			rv := readableValue(v)
-			if !rv.CanInterface() {
-				// Unreachable with an addressable root, but a cache key must
-				// never panic: encode the type and give up on the instant.
-				sb.WriteString("t?;")
-				return
-			}
-			t := rv.Interface().(time.Time)
-			fmt.Fprintf(sb, "t%d.%09d;", t.UTC().Unix(), t.Nanosecond())
-			return
-		}
-		t := v.Type()
-		writeTypeTag(sb, v)
-		sb.WriteString("{")
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			if f.PkgPath != "" {
-				// Unexported, so not part of the API -- EXCEPT an anonymous
-				// one, whose own exported fields are promoted and are. A
-				// public type embedding an unexported struct exposes v.ID to
-				// every caller, and skipping the whole embed meant a value
-				// differing only there hashed the same.
-				//
-				// A POINTER to a struct promotes its fields too, so
-				// `struct{ *inner }` reads v.ID exactly as `struct{ inner }`
-				// does; testing only for Kind() == Struct skipped it.
-				if !f.Anonymous || !promotesFields(f.Type) {
-					continue
-				}
-				fmt.Fprintf(sb, "%d:%s=", len(f.Name), f.Name)
-				encodeForHash(sb, v.Field(i))
-				continue
-			}
-			// The field NAME is included so renaming or reordering fields
-			// cannot collide, and no json tag is consulted.
-			fmt.Fprintf(sb, "%d:%s=", len(f.Name), f.Name)
-			encodeForHash(sb, v.Field(i))
-		}
-		sb.WriteString("}")
+		encodeStructForHash(sb, v)
 
 	case reflect.Slice, reflect.Array:
-		if v.Kind() == reflect.Slice && v.IsNil() {
-			sb.WriteString("nil;")
-			return
-		}
-		fmt.Fprintf(sb, "[%d", v.Len())
-		for i := 0; i < v.Len(); i++ {
-			sb.WriteByte(',')
-			encodeForHash(sb, v.Index(i))
-		}
-		sb.WriteString("]")
+		encodeSequenceForHash(sb, v)
 
 	case reflect.Map:
-		if v.IsNil() {
-			sb.WriteString("nil;")
-			return
-		}
-		// Map iteration order is randomized, so the keys are sorted by their
-		// own encoding to keep the digest stable.
-		//
-		// Keys are encoded by CONTENT, which is what makes the digest
-		// reproducible across runs and what makes a pointer-keyed map
-		// imperfectly represented here -- see Config.HashFunc.
-		//
-		// MapRange, not MapKeys plus MapIndex: a NaN float or complex key is
-		// returned by MapKeys but is not equal to itself, so MapIndex(key)
-		// comes back invalid and its value was encoded as "nil;" -- changing
-		// that value alone left GetHash() unchanged. The iterator keeps each
-		// value paired with its key.
-		entries := make([]string, 0, v.Len())
-		for iter := v.MapRange(); iter.Next(); {
-			var entry strings.Builder
-			// Map keys and values are never addressable either.
-			encodeForHash(&entry, addressable(iter.Key()))
-			entry.WriteByte('=')
-			encodeForHash(&entry, addressable(iter.Value()))
-			entries = append(entries, entry.String())
-		}
-		sort.Strings(entries)
-		fmt.Fprintf(sb, "m%d", len(entries))
-		for _, e := range entries {
-			fmt.Fprintf(sb, ",%d:%s", len(e), e)
-		}
+		encodeMapForHash(sb, v)
 
 	case reflect.String:
 		fmt.Fprintf(sb, "%d:%s;", len(v.String()), v.String())
@@ -541,4 +441,124 @@ func StringSorter[V any](keyFunc func(V) string) func([]V) []V {
 		})
 		return result
 	}
+}
+
+func encodeIndirectForHash(sb *strings.Builder, v reflect.Value) {
+	// Follow the pointer: its ADDRESS is not content.
+	if v.IsNil() {
+		sb.WriteString("nil;")
+		return
+	}
+	if v.Kind() == reflect.Interface {
+		// What the interface HOLDS is content. Following it blind made
+		// any(int(1)) and any(int64(1)) -- and any two struct types with
+		// the same exported shape -- encode identically, so swapping one
+		// for the other left GetHash() unchanged.
+		writeTypeTag(sb, v.Elem())
+	}
+	// addressable: an interface's dynamic value is never addressable, and
+	// a pointer's target always is, so this only costs a copy on the
+	// interface path -- where it is what keeps an embedded instant
+	// readable further down.
+	encodeForHash(sb, addressable(v.Elem()))
+
+}
+
+func encodeStructForHash(sb *strings.Builder, v reflect.Value) {
+	if v.Type() == timeType {
+		// Wall clock only, and in UTC: the monotonic reading and the
+		// location pointer are not content.
+		// Seconds plus nanoseconds, never UnixNano: that is undefined
+		// outside 1678..2262, and it wraps modulo 2^64, so two instants
+		// 584.9 years apart encoded identically and the same instant
+		// could encode differently on another implementation. Unix() is
+		// valid across the whole range.
+		rv := readableValue(v)
+		if !rv.CanInterface() {
+			// Unreachable with an addressable root, but a cache key must
+			// never panic: encode the type and give up on the instant.
+			sb.WriteString("t?;")
+			return
+		}
+		t := rv.Interface().(time.Time)
+		fmt.Fprintf(sb, "t%d.%09d;", t.UTC().Unix(), t.Nanosecond())
+		return
+	}
+	t := v.Type()
+	writeTypeTag(sb, v)
+	sb.WriteString("{")
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			// Unexported, so not part of the API -- EXCEPT an anonymous
+			// one, whose own exported fields are promoted and are. A
+			// public type embedding an unexported struct exposes v.ID to
+			// every caller, and skipping the whole embed meant a value
+			// differing only there hashed the same.
+			//
+			// A POINTER to a struct promotes its fields too, so
+			// `struct{ *inner }` reads v.ID exactly as `struct{ inner }`
+			// does; testing only for Kind() == Struct skipped it.
+			if !f.Anonymous || !promotesFields(f.Type) {
+				continue
+			}
+			fmt.Fprintf(sb, "%d:%s=", len(f.Name), f.Name)
+			encodeForHash(sb, v.Field(i))
+			continue
+		}
+		// The field NAME is included so renaming or reordering fields
+		// cannot collide, and no json tag is consulted.
+		fmt.Fprintf(sb, "%d:%s=", len(f.Name), f.Name)
+		encodeForHash(sb, v.Field(i))
+	}
+	sb.WriteString("}")
+
+}
+
+func encodeSequenceForHash(sb *strings.Builder, v reflect.Value) {
+	if v.Kind() == reflect.Slice && v.IsNil() {
+		sb.WriteString("nil;")
+		return
+	}
+	fmt.Fprintf(sb, "[%d", v.Len())
+	for i := 0; i < v.Len(); i++ {
+		sb.WriteByte(',')
+		encodeForHash(sb, v.Index(i))
+	}
+	sb.WriteString("]")
+
+}
+
+func encodeMapForHash(sb *strings.Builder, v reflect.Value) {
+	if v.IsNil() {
+		sb.WriteString("nil;")
+		return
+	}
+	// Map iteration order is randomized, so the keys are sorted by their
+	// own encoding to keep the digest stable.
+	//
+	// Keys are encoded by CONTENT, which is what makes the digest
+	// reproducible across runs and what makes a pointer-keyed map
+	// imperfectly represented here -- see Config.HashFunc.
+	//
+	// MapRange, not MapKeys plus MapIndex: a NaN float or complex key is
+	// returned by MapKeys but is not equal to itself, so MapIndex(key)
+	// comes back invalid and its value was encoded as "nil;" -- changing
+	// that value alone left GetHash() unchanged. The iterator keeps each
+	// value paired with its key.
+	entries := make([]string, 0, v.Len())
+	for iter := v.MapRange(); iter.Next(); {
+		var entry strings.Builder
+		// Map keys and values are never addressable either.
+		encodeForHash(&entry, addressable(iter.Key()))
+		entry.WriteByte('=')
+		encodeForHash(&entry, addressable(iter.Value()))
+		entries = append(entries, entry.String())
+	}
+	sort.Strings(entries)
+	fmt.Fprintf(sb, "m%d", len(entries))
+	for _, e := range entries {
+		fmt.Fprintf(sb, ",%d:%s", len(e), e)
+	}
+
 }
