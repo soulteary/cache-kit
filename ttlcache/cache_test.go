@@ -116,15 +116,11 @@ func TestTTLExpireAndClear(t *testing.T) {
 	if err := c.Set("default", "a", 0); err != nil {
 		t.Fatal(err)
 	}
-	if ttl, ok := c.TTL("default"); !ok || ttl != time.Minute {
-		t.Fatalf("default TTL = %v, %v", ttl, ok)
-	}
+	assertDefaultTTL(t, c, time.Minute)
 	if !c.Expire("default", NoExpiration) {
 		t.Fatal("Expire(NoExpiration) failed")
 	}
-	if ttl, ok := c.TTL("default"); !ok || ttl != NoExpiration {
-		t.Fatalf("persistent TTL = %v, %v", ttl, ok)
-	}
+	assertDefaultTTL(t, c, NoExpiration)
 	if !c.Expire("default", 2*time.Second) {
 		t.Fatal("Expire failed")
 	}
@@ -227,3 +223,10 @@ func BenchmarkGetHit(b *testing.B) {
 }
 
 var _ atomic.Uint64
+
+func assertDefaultTTL(t *testing.T, c *Memory[string, string], want time.Duration) {
+	t.Helper()
+	if ttl, ok := c.TTL("default"); !ok || ttl != want {
+		t.Fatalf("default TTL = %v, %v; want %v", ttl, ok, want)
+	}
+}
