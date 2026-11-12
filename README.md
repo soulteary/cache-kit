@@ -28,7 +28,7 @@ See [Dependency footprint](#dependency-footprint).
 
 ## Requirements
 
-- **Go 1.27.3+** (`go.mod` declares `go 1.27.3`)
+- **Go 1.27.4+** (`go.mod` declares `go 1.27.4`)
 - `github.com/redis/go-redis/v9` when importing `./rediscache` or `./ttlcache/redisadapter`
 - `github.com/soulteary/redis-kit` when importing `./ttlcache/redisadapter`
 - Redis with `EVAL` support (any 2.6+) when `MaxValueBytes` is set
