@@ -26,7 +26,7 @@ cache-kit 提供两套互不依赖的内存缓存：根包用于多索引集合�
 
 ## 要求
 
-- **Go 1.27.3+**（`go.mod` 声明 `go 1.27.3`）
+- **Go 1.27.4+**（`go.mod` 声明 `go 1.27.4`）
 - 导入 `./rediscache` 或 `./ttlcache/redisadapter` 时需要 `github.com/redis/go-redis/v9`
 - 导入 `./ttlcache/redisadapter` 时还会使用 `github.com/soulteary/redis-kit`
 - 设置了 `MaxValueBytes` 时，Redis 需支持 `EVAL`（2.6+ 均可）
