@@ -10,6 +10,15 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+## [2.1.3] — 2026-11-24
+
+### Changed
+
+- Select `redis-kit` v1.8.3 for the optional Redis-backed TTL adapter.
+- Update the indirect `golang.org/x/sys` requirement from v0.49.0 to v0.50.0.
+
+The module path, public API and Go 1.27.4 requirement are unchanged.
+
 ## [2.1.2] — 2026-11-13
 
 ### Changed
@@ -262,7 +271,10 @@ Redis value guard both behave differently.
 
 Predate this file; see the git history.
 
-[Unreleased]: https://github.com/soulteary/cache-kit/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/soulteary/cache-kit/compare/v2.1.3...HEAD
+[2.1.3]: https://github.com/soulteary/cache-kit/compare/v2.1.2...v2.1.3
+[2.1.2]: https://github.com/soulteary/cache-kit/compare/v2.1.1...v2.1.2
+[2.1.1]: https://github.com/soulteary/cache-kit/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/soulteary/cache-kit/compare/v2.0.3...v2.1.0
 [2.0.0]: https://github.com/soulteary/cache-kit/compare/v1.7.0...v2.0.0
 [1.7.0]: https://github.com/soulteary/cache-kit/compare/v1.6.0...v1.7.0
