@@ -10,6 +10,15 @@ also changes the module path. The current one is
 
 ## [Unreleased]
 
+## [2.1.4] — 2026-11-25
+
+### Changed
+
+- Update `github.com/redis/go-redis/v9` from v9.23.0 to v9.24.0.
+- Select `redis-kit` v1.8.4 for the optional Redis-backed TTL adapter.
+- Document the upstream retry, timeout and connection-pool behavior changes
+  in the [release notes](docs/releases/v2.1.4.md).
+
 ## [2.1.3] — 2026-11-24
 
 ### Changed
@@ -271,7 +280,8 @@ Redis value guard both behave differently.
 
 Predate this file; see the git history.
 
-[Unreleased]: https://github.com/soulteary/cache-kit/compare/v2.1.3...HEAD
+[Unreleased]: https://github.com/soulteary/cache-kit/compare/v2.1.4...HEAD
+[2.1.4]: https://github.com/soulteary/cache-kit/compare/v2.1.3...v2.1.4
 [2.1.3]: https://github.com/soulteary/cache-kit/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/soulteary/cache-kit/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/soulteary/cache-kit/compare/v2.1.0...v2.1.1
